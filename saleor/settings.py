@@ -6,8 +6,6 @@ from datetime import timedelta
 import dj_database_url
 import dj_email_url
 import django_cache_url
-import jaeger_client
-import jaeger_client.config
 import pkg_resources
 import sentry_sdk
 import sentry_sdk.utils
@@ -602,6 +600,8 @@ WEBHOOK_EXCLUDED_SHIPPING_REQUEST_TIMEOUT = int(
 # If running locally, set:
 #   JAEGER_AGENT_HOST=localhost
 if "JAEGER_AGENT_HOST" in os.environ:
+    import jaeger_client
+    import jaeger_client.config
     jaeger_client.Config(
         config={
             "sampler": {"type": "const", "param": 1},

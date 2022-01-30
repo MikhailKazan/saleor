@@ -22,7 +22,7 @@ from graphql import GraphQLDocument, get_default_backend
 from graphql.error import GraphQLError, GraphQLSyntaxError
 from graphql.error import format_error as format_graphql_error
 from graphql.execution import ExecutionResult
-from jwt.exceptions import PyJWTError
+from jwt.exceptions import JWTException
 
 from .. import __version__ as saleor_version
 from ..core.exceptions import PermissionDenied, ReadOnlyException
@@ -66,7 +66,7 @@ class GraphQLView(View):
     middleware = None
     root_value = None
 
-    HANDLED_EXCEPTIONS = (GraphQLError, PyJWTError, ReadOnlyException, PermissionDenied)
+    HANDLED_EXCEPTIONS = (GraphQLError, JWTException, ReadOnlyException, PermissionDenied)
 
     def __init__(
         self, schema=None, executor=None, middleware=None, root_value=None, backend=None
