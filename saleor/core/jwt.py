@@ -4,17 +4,16 @@ from typing import Any, Dict, Iterable, Optional
 import graphene
 import jwt
 from django.conf import settings
-from django.contrib.auth.models import Permission
 
 from ..account.models import User
 from ..app.models import App, AppExtension
-from .permissions import (
+from ..permission.enums import (
     get_permission_names,
     get_permissions_from_codenames,
     get_permissions_from_names,
 )
-
-JWT_ALGORITHM = "HS256"
+from ..permission.models import Permission
+from .jwt_manager import get_jwt_manager
 
 JWT_ACCESS_TYPE = "access"
 JWT_REFRESH_TYPE = "refresh"
@@ -22,6 +21,7 @@ JWT_THIRDPARTY_ACCESS_TYPE = "thirdparty"
 JWT_REFRESH_TOKEN_COOKIE_NAME = "refreshToken"
 
 PERMISSIONS_FIELD = "permissions"
+USER_PERMISSION_FIELD = "user_permissions"
 JWT_SALEOR_OWNER_NAME = "saleor"
 JWT_OWNER_FIELD = "owner"
 
@@ -30,7 +30,12 @@ def jwt_base_payload(
     exp_delta: Optional[timedelta], token_owner: str
 ) -> Dict[str, Any]:
     utc_now = datetime.utcnow()
-    payload = {"iat": utc_now, JWT_OWNER_FIELD: token_owner}
+
+    payload = {
+        "iat": utc_now,
+        JWT_OWNER_FIELD: token_owner,
+        "iss": get_jwt_manager().get_issuer(),
+    }
     if exp_delta:
         payload["exp"] = utc_now + exp_delta
     return payload
@@ -60,11 +65,8 @@ def jwt_user_payload(
 
 
 def jwt_encode(payload: Dict[str, Any]) -> str:
-    return jwt.encode(
-        payload,
-        settings.SECRET_KEY,  # type: ignore
-        JWT_ALGORITHM,
-    )
+    jwt_manager = get_jwt_manager()
+    return jwt_manager.encode(payload)
 
 
 def jwt_decode_with_exception_handler(
@@ -76,13 +78,11 @@ def jwt_decode_with_exception_handler(
         return None
 
 
-def jwt_decode(token: str, verify_expiration=settings.JWT_EXPIRE) -> Dict[str, Any]:
-    return jwt.decode(
-        token,
-        settings.SECRET_KEY,  # type: ignore
-        algorithms=[JWT_ALGORITHM],
-        options={"verify_exp": verify_expiration},
-    )
+def jwt_decode(
+    token: str, verify_expiration=settings.JWT_EXPIRE, verify_aud: bool = False
+) -> Dict[str, Any]:
+    jwt_manager = get_jwt_manager()
+    return jwt_manager.decode(token, verify_expiration, verify_aud=verify_aud)
 
 
 def create_token(payload: Dict[str, Any], exp_delta: timedelta) -> str:
@@ -111,7 +111,8 @@ def create_refresh_token(
     return jwt_encode(payload)
 
 
-def get_user_from_payload(payload: Dict[str, Any]) -> Optional[User]:
+def get_user_from_payload(payload: Dict[str, Any], request=None) -> Optional[User]:
+    # TODO: dataloader
     user = User.objects.filter(email=payload["email"], is_active=True).first()
     user_jwt_token = payload.get("token")
     if not user_jwt_token or not user:
@@ -137,21 +138,14 @@ def is_saleor_token(token: str) -> bool:
     return True
 
 
-def get_user_from_access_token(token: str) -> Optional[User]:
-    if not is_saleor_token(token):
-        return None
-    payload = jwt_decode(token)
-    return get_user_from_access_payload(payload)
-
-
-def get_user_from_access_payload(payload: dict) -> Optional[User]:
+def get_user_from_access_payload(payload: dict, request=None) -> Optional[User]:
     jwt_type = payload.get("type")
     if jwt_type not in [JWT_ACCESS_TYPE, JWT_THIRDPARTY_ACCESS_TYPE]:
         raise jwt.InvalidTokenError(
             "Invalid token. Create new one by using tokenCreate mutation."
         )
     permissions = payload.get(PERMISSIONS_FIELD, None)
-    user = get_user_from_payload(payload)
+    user = get_user_from_payload(payload, request)
     if user:
         if permissions is not None:
             token_permissions = get_permissions_from_names(permissions)
@@ -170,6 +164,7 @@ def _create_access_token_for_third_party_actions(
     type: str,
     object_id: int,
     object_payload_key: str,
+    audience: Optional[str],
 ):
     app_permission_enums = get_permission_names(permissions)
 
@@ -178,7 +173,10 @@ def _create_access_token_for_third_party_actions(
     additional_payload = {
         object_payload_key: graphene.Node.to_global_id(type, object_id),
         PERMISSIONS_FIELD: list(app_permission_enums & user_permission_enums),
+        USER_PERMISSION_FIELD: list(user_permission_enums),
     }
+    if audience:
+        additional_payload["aud"] = audience
 
     payload = jwt_user_payload(
         user,
@@ -204,11 +202,15 @@ def create_access_token_for_app(app: "App", user: "User"):
         type="App",
         object_id=app.id,
         object_payload_key="app",
+        audience=app.audience,
     )
 
 
 def create_access_token_for_app_extension(
-    app_extension: "AppExtension", permissions: Iterable["Permission"], user: "User"
+    app_extension: "AppExtension",
+    permissions: Iterable["Permission"],
+    user: "User",
+    app: "App",
 ):
     return _create_access_token_for_third_party_actions(
         permissions=permissions,
@@ -216,4 +218,5 @@ def create_access_token_for_app_extension(
         type="AppExtension",
         object_id=app_extension.id,
         object_payload_key="app_extension",
+        audience=app.audience,
     )

@@ -2,37 +2,46 @@ import datetime
 from decimal import Decimal
 from unittest.mock import Mock
 
-from django_countries.fields import Country
+from django.utils import timezone
 from freezegun import freeze_time
 from prices import Money, TaxedMoney, TaxedMoneyRange
 
-from ...plugins.manager import PluginsManager, get_plugins_manager
+from ...tax import TaxCalculationStrategy
 from .. import models
 from ..utils.availability import get_product_availability
 
 
 def test_availability(stock, monkeypatch, settings, channel_USD):
     product = stock.product_variant.product
+    tax_class = product.tax_class or product.product_type.tax_class
+
+    tc = channel_USD.tax_configuration
+    tc.tax_calculation_strategy = TaxCalculationStrategy.FLAT_RATES
+    tc.charge_taxes = True
+    tc.prices_entered_with_tax = False
+    tc.save()
+
+    tax_rate = Decimal(23)
+    country = "PL"
+    tax_class.country_rates.update_or_create(rate=tax_rate, country=country)
+
     product_channel_listing = product.channel_listings.first()
     variants = product.variants.all()
     variants_channel_listing = models.ProductVariantChannelListing.objects.filter(
         variant__in=variants
     )
     taxed_price = TaxedMoney(Money("10.0", "USD"), Money("12.30", "USD"))
-    monkeypatch.setattr(
-        PluginsManager, "apply_taxes_to_product", Mock(return_value=taxed_price)
-    )
-    manager = get_plugins_manager()
     availability = get_product_availability(
         product=product,
         product_channel_listing=product_channel_listing,
         variants=product.variants.all(),
         variants_channel_listing=variants_channel_listing,
         channel=channel_USD,
-        manager=manager,
         collections=[],
         discounts=[],
-        country=Country("PL"),
+        tax_rate=tax_rate,
+        tax_calculation_strategy=tc.tax_calculation_strategy,
+        prices_entered_with_tax=tc.prices_entered_with_tax,
     )
     taxed_price_range = TaxedMoneyRange(start=taxed_price, stop=taxed_price)
     assert availability.price_range == taxed_price_range
@@ -52,9 +61,10 @@ def test_availability(stock, monkeypatch, settings, channel_USD):
         collections=[],
         discounts=[],
         channel=channel_USD,
-        manager=manager,
         local_currency="PLN",
-        country=Country("PL"),
+        tax_rate=tax_rate,
+        tax_calculation_strategy=tc.tax_calculation_strategy,
+        prices_entered_with_tax=tc.prices_entered_with_tax,
     )
     assert availability.price_range_local_currency.start.currency == "PLN"
 
@@ -66,8 +76,9 @@ def test_availability(stock, monkeypatch, settings, channel_USD):
         collections=[],
         discounts=[],
         channel=channel_USD,
-        manager=manager,
-        country=Country("PL"),
+        tax_rate=tax_rate,
+        tax_calculation_strategy=tc.tax_calculation_strategy,
+        prices_entered_with_tax=tc.prices_entered_with_tax,
     )
     assert availability.price_range.start.tax.amount
     assert availability.price_range.stop.tax.amount
@@ -77,6 +88,8 @@ def test_availability(stock, monkeypatch, settings, channel_USD):
 
 def test_availability_with_all_variant_channel_listings(stock, channel_USD):
     # given
+    tax_config = channel_USD.tax_configuration
+
     product = stock.product_variant.product
     product_channel_listing = product.channel_listings.first()
     variants = product.variants.all()
@@ -86,7 +99,6 @@ def test_availability_with_all_variant_channel_listings(stock, channel_USD):
     [variant1_channel_listing, variant2_channel_listing] = variants_channel_listing
     variant2_channel_listing.price_amount = Decimal(15)
     variant2_channel_listing.save()
-    manager = get_plugins_manager()
 
     # when
     availability = get_product_availability(
@@ -95,10 +107,11 @@ def test_availability_with_all_variant_channel_listings(stock, channel_USD):
         variants=variants,
         variants_channel_listing=variants_channel_listing,
         channel=channel_USD,
-        manager=manager,
         collections=[],
         discounts=[],
-        country=Country("PL"),
+        prices_entered_with_tax=tax_config.prices_entered_with_tax,
+        tax_calculation_strategy=tax_config.tax_calculation_strategy,
+        tax_rate=Decimal(0),
     )
 
     # then
@@ -110,6 +123,7 @@ def test_availability_with_all_variant_channel_listings(stock, channel_USD):
 def test_availability_with_missing_variant_channel_listings(stock, channel_USD):
     # given
     product = stock.product_variant.product
+
     product_channel_listing = product.channel_listings.first()
     variants = product.variants.all()
     variants_channel_listing = models.ProductVariantChannelListing.objects.filter(
@@ -117,7 +131,6 @@ def test_availability_with_missing_variant_channel_listings(stock, channel_USD):
     )
     [variant1_channel_listing, variant2_channel_listing] = variants_channel_listing
     variant2_channel_listing.delete()
-    manager = get_plugins_manager()
 
     # when
     availability = get_product_availability(
@@ -126,10 +139,11 @@ def test_availability_with_missing_variant_channel_listings(stock, channel_USD):
         variants=variants,
         variants_channel_listing=variants_channel_listing,
         channel=channel_USD,
-        manager=manager,
         collections=[],
         discounts=[],
-        country=Country("PL"),
+        prices_entered_with_tax=channel_USD.tax_configuration.prices_entered_with_tax,
+        tax_calculation_strategy="TAX_APP",
+        tax_rate=Decimal(0),
     )
 
     # then
@@ -146,7 +160,6 @@ def test_availability_without_variant_channel_listings(stock, channel_USD):
     models.ProductVariantChannelListing.objects.filter(
         variant__in=variants, channel=channel_USD
     ).delete()
-    manager = get_plugins_manager()
 
     # when
     availability = get_product_availability(
@@ -155,10 +168,11 @@ def test_availability_without_variant_channel_listings(stock, channel_USD):
         variants=variants,
         variants_channel_listing=[],
         channel=channel_USD,
-        manager=manager,
         collections=[],
         discounts=[],
-        country=Country("PL"),
+        tax_rate=Decimal(0),
+        tax_calculation_strategy="TAX_APP",
+        prices_entered_with_tax=True,
     )
 
     # then
@@ -183,9 +197,9 @@ def test_available_products_only_published(product_list, channel_USD):
 
 def test_available_products_only_available(product_list, channel_USD):
     channel_listing = product_list[0].channel_listings.get()
-    date_tomorrow = datetime.date.today() + datetime.timedelta(days=1)
-    channel_listing.publication_date = date_tomorrow
-    channel_listing.save(update_fields=["publication_date"])
+    date_tomorrow = timezone.now() + datetime.timedelta(days=1)
+    channel_listing.published_at = date_tomorrow
+    channel_listing.save(update_fields=["published_at"])
 
     available_products = models.Product.objects.published(channel_USD.slug)
     assert available_products.count() == 2
@@ -199,9 +213,9 @@ def test_available_products_only_available(product_list, channel_USD):
 
 def test_available_products_available_from_yesterday(product_list, channel_USD):
     channel_listing = product_list[0].channel_listings.get()
-    date_tomorrow = datetime.date.today() - datetime.timedelta(days=1)
-    channel_listing.publication_date = date_tomorrow
-    channel_listing.save(update_fields=["publication_date"])
+    date_tomorrow = timezone.now() - datetime.timedelta(days=1)
+    channel_listing.published_at = date_tomorrow
+    channel_listing.save(update_fields=["published_at"])
 
     available_products = models.Product.objects.published(channel_USD.slug)
     assert available_products.count() == 3
@@ -236,7 +250,7 @@ def test_available_products_available_with_many_channels(
 @freeze_time("2020-03-18 12:00:00")
 def test_product_is_visible_from_today(product):
     product_channel_listing = product.channel_listings.get()
-    product_channel_listing.publication_date = datetime.date.today()
+    product_channel_listing.published_at = timezone.now()
     product_channel_listing.save()
     assert product_channel_listing.is_visible
 
@@ -304,22 +318,22 @@ def test_filter_not_published_product_is_unpublished(product, channel_USD):
 
 
 def test_filter_not_published_product_published_tomorrow(product, channel_USD):
-    date_tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    date_tomorrow = timezone.now() + datetime.timedelta(days=1)
     channel_listing = product.channel_listings.get()
     channel_listing.is_published = True
-    channel_listing.publication_date = date_tomorrow
-    channel_listing.save(update_fields=["is_published", "publication_date"])
+    channel_listing.published_at = date_tomorrow
+    channel_listing.save(update_fields=["is_published", "published_at"])
 
     available_products = models.Product.objects.not_published(channel_USD.slug)
     assert available_products.count() == 1
 
 
 def test_filter_not_published_product_not_published_tomorrow(product, channel_USD):
-    date_tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    date_tomorrow = timezone.now() + datetime.timedelta(days=1)
     channel_listing = product.channel_listings.get()
     channel_listing.is_published = False
-    channel_listing.publication_date = date_tomorrow
-    channel_listing.save(update_fields=["is_published", "publication_date"])
+    channel_listing.published_at = date_tomorrow
+    channel_listing.save(update_fields=["is_published", "published_at"])
 
     available_products = models.Product.objects.not_published(channel_USD.slug)
     assert available_products.count() == 1

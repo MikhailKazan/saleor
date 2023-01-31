@@ -1,27 +1,34 @@
 import ast
+import logging
+import os
 import os.path
 import warnings
 from datetime import timedelta
+from typing import List
 
 import dj_database_url
 import dj_email_url
 import django_cache_url
-import jaeger_client
+import django_stubs_ext
 import jaeger_client.config
 import pkg_resources
 import sentry_sdk
 import sentry_sdk.utils
 from celery.schedules import crontab
+from django.conf import global_settings
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management.utils import get_random_secret_key
-from graphql.utils import schema_printer
+from graphql.execution import executor
 from pytimeparse import parse
 from sentry_sdk.integrations.celery import CeleryIntegration
 from sentry_sdk.integrations.django import DjangoIntegration
 from sentry_sdk.integrations.logging import ignore_logger
 
-from . import patched_print_object
+from . import PatchedSubscriberExecutionContext, __version__
 from .core.languages import LANGUAGES as CORE_LANGUAGES
+from .core.schedules import initiated_sale_webhook_schedule
+
+django_stubs_ext.monkeypatch()
 
 
 def get_list(text):
@@ -53,6 +60,8 @@ ADMINS = (
 )
 MANAGERS = ADMINS
 
+APPEND_SLASH = False
+
 _DEFAULT_CLIENT_HOSTS = "localhost,127.0.0.1"
 
 ALLOWED_CLIENT_HOSTS = os.environ.get("ALLOWED_CLIENT_HOSTS")
@@ -68,6 +77,11 @@ ALLOWED_CLIENT_HOSTS = get_list(ALLOWED_CLIENT_HOSTS)
 
 INTERNAL_IPS = get_list(os.environ.get("INTERNAL_IPS", "127.0.0.1"))
 
+# Maximum time in seconds Django can keep the database connections opened.
+# Set the value to 0 to disable connection persistence, database connections
+# will be closed after each request.
+DB_CONN_MAX_AGE = int(os.environ.get("DB_CONN_MAX_AGE", 600))
+
 DATABASE_CONNECTION_DEFAULT_NAME = "default"
 # TODO: For local envs will be activated in separate PR.
 # We need to update docs an saleor platform.
@@ -76,15 +90,18 @@ DATABASE_CONNECTION_REPLICA_NAME = "default"
 
 DATABASES = {
     DATABASE_CONNECTION_DEFAULT_NAME: dj_database_url.config(
-        default="postgres://saleor:saleor@localhost:5432/saleor", conn_max_age=600
+        default="postgres://saleor:saleor@localhost:5432/saleor",
+        conn_max_age=DB_CONN_MAX_AGE,
     ),
     # TODO: We need to add read only user to saleor platfrom, and we need to update
     # docs.
     # DATABASE_CONNECTION_REPLICA_NAME: dj_database_url.config(
     #     default="postgres://saleor_read_only:saleor@localhost:5432/saleor",
-    #     conn_max_age=600,
+    #     conn_max_age=DB_CONN_MAX_AGE,
     # ),
 }
+
+DATABASE_ROUTERS = ["saleor.core.db_routers.PrimaryReplicaRouter"]
 
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 
@@ -102,10 +119,11 @@ EMAIL_URL = os.environ.get("EMAIL_URL")
 SENDGRID_USERNAME = os.environ.get("SENDGRID_USERNAME")
 SENDGRID_PASSWORD = os.environ.get("SENDGRID_PASSWORD")
 if not EMAIL_URL and SENDGRID_USERNAME and SENDGRID_PASSWORD:
-    EMAIL_URL = "smtp://%s:%s@smtp.sendgrid.net:587/?tls=True" % (
-        SENDGRID_USERNAME,
-        SENDGRID_PASSWORD,
+    EMAIL_URL = (
+        f"smtp://{SENDGRID_USERNAME}"
+        f":{SENDGRID_PASSWORD}@smtp.sendgrid.net:587/?tls=True"
     )
+
 email_config = dj_email_url.parse(
     EMAIL_URL or "console://demo@example.com:console@example/"
 )
@@ -173,18 +191,28 @@ TEMPLATES = [
 # Make this unique, and don't share it with anybody.
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
+# Additional password algorithms that can be used by Saleor.
+# The first algorithm defined by Django is the preferred one; users not using the
+# first algorithm will automatically be upgraded to it upon login
+PASSWORD_HASHERS = [
+    *global_settings.PASSWORD_HASHERS,
+    "django.contrib.auth.hashers.BCryptPasswordHasher",
+]
+
 if not SECRET_KEY and DEBUG:
     warnings.warn("SECRET_KEY not configured, using a random temporary key.")
     SECRET_KEY = get_random_secret_key()
 
+RSA_PRIVATE_KEY = os.environ.get("RSA_PRIVATE_KEY", None)
+RSA_PRIVATE_PASSWORD = os.environ.get("RSA_PRIVATE_PASSWORD", None)
+JWT_MANAGER_PATH = os.environ.get(
+    "JWT_MANAGER_PATH", "saleor.core.jwt_manager.JWTManager"
+)
+
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.common.CommonMiddleware",
-    "saleor.core.middleware.request_time",
-    "saleor.core.middleware.discounts",
     "saleor.core.middleware.google_analytics",
-    "saleor.core.middleware.site",
-    "saleor.core.middleware.plugins",
     "saleor.core.middleware.jwt_refresh_token_middleware",
 ]
 
@@ -195,10 +223,11 @@ INSTALLED_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.sites",
     "django.contrib.staticfiles",
-    "django.contrib.auth",
     "django.contrib.postgres",
     "django_celery_beat",
     # Local apps
+    "saleor.permission",
+    "saleor.auth",
     "saleor.plugins",
     "saleor.account",
     "saleor.discount",
@@ -218,17 +247,17 @@ INSTALLED_APPS = [
     "saleor.site",
     "saleor.page",
     "saleor.payment",
+    "saleor.tax",
     "saleor.warehouse",
     "saleor.webhook",
-    "saleor.wishlist",
     "saleor.app",
+    "saleor.thumbnail",
+    "saleor.schedulers",
     # External apps
-    "versatileimagefield",
     "django_measurement",
     "django_prices",
     "django_prices_openexchangerates",
     "django_prices_vatlayer",
-    "graphene_django",
     "mptt",
     "django_countries",
     "django_filters",
@@ -266,6 +295,10 @@ if ENABLE_DEBUG_TOOLBAR:
         ]
         DEBUG_TOOLBAR_CONFIG = {"RESULTS_CACHE_SIZE": 100}
 
+# Make the `logging` Python module capture `warnings.warn()` calls
+# This is needed in order to log them as JSON when DEBUG=False
+logging.captureWarnings(True)
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -301,7 +334,8 @@ LOGGING = {
         },
         "verbose": {
             "format": (
-                "%(levelname)s %(name)s %(message)s [PID:%(process)d:%(threadName)s]"
+                "%(asctime)s %(levelname)s %(name)s %(message)s "
+                "[PID:%(process)d:%(threadName)s]"
             )
         },
     },
@@ -354,6 +388,7 @@ LOGGING = {
             "propagate": False,
         },
         "graphql.execution.utils": {"propagate": False, "handlers": ["null"]},
+        "graphql.execution.executor": {"propagate": False, "handlers": ["null"]},
     },
 }
 
@@ -393,6 +428,8 @@ PAYMENT_HOST = get_host
 
 PAYMENT_MODEL = "order.Payment"
 
+MAX_USER_ADDRESSES = int(os.environ.get("MAX_USER_ADDRESSES", 100))
+
 TEST_RUNNER = "saleor.tests.runner.PytestTestRunner"
 
 
@@ -420,8 +457,11 @@ AWS_DEFAULT_ACL = os.environ.get("AWS_DEFAULT_ACL", None)
 AWS_S3_FILE_OVERWRITE = get_bool_from_env("AWS_S3_FILE_OVERWRITE", True)
 
 # Google Cloud Storage configuration
+# See https://django-storages.readthedocs.io/en/latest/backends/gcloud.html
 GS_PROJECT_ID = os.environ.get("GS_PROJECT_ID")
 GS_BUCKET_NAME = os.environ.get("GS_BUCKET_NAME")
+GS_LOCATION = os.environ.get("GS_LOCATION", "")
+GS_CUSTOM_ENDPOINT = os.environ.get("GS_CUSTOM_ENDPOINT")
 GS_MEDIA_BUCKET_NAME = os.environ.get("GS_MEDIA_BUCKET_NAME")
 GS_AUTO_CREATE_BUCKET = get_bool_from_env("GS_AUTO_CREATE_BUCKET", False)
 GS_QUERYSTRING_AUTH = get_bool_from_env("GS_QUERYSTRING_AUTH", False)
@@ -435,6 +475,13 @@ GS_FILE_OVERWRITE = get_bool_from_env("GS_FILE_OVERWRITE", True)
 if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
     GS_CREDENTIALS = os.environ.get("GS_CREDENTIALS")
 
+# Azure Storage configuration
+# See https://django-storages.readthedocs.io/en/latest/backends/azure.html
+AZURE_ACCOUNT_NAME = os.environ.get("AZURE_ACCOUNT_NAME")
+AZURE_ACCOUNT_KEY = os.environ.get("AZURE_ACCOUNT_KEY")
+AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER")
+AZURE_SSL = os.environ.get("AZURE_SSL")
+
 if AWS_STORAGE_BUCKET_NAME:
     STATICFILES_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
 elif GS_BUCKET_NAME:
@@ -442,38 +489,21 @@ elif GS_BUCKET_NAME:
 
 if AWS_MEDIA_BUCKET_NAME:
     DEFAULT_FILE_STORAGE = "saleor.core.storages.S3MediaStorage"
-    THUMBNAIL_DEFAULT_STORAGE = DEFAULT_FILE_STORAGE
 elif GS_MEDIA_BUCKET_NAME:
     DEFAULT_FILE_STORAGE = "saleor.core.storages.GCSMediaStorage"
-    THUMBNAIL_DEFAULT_STORAGE = DEFAULT_FILE_STORAGE
-
-VERSATILEIMAGEFIELD_RENDITION_KEY_SETS = {
-    "products": [
-        ("product_gallery", "thumbnail__540x540"),
-        ("product_gallery_2x", "thumbnail__1080x1080"),
-        ("product_small", "thumbnail__60x60"),
-        ("product_small_2x", "thumbnail__120x120"),
-        ("product_list", "thumbnail__255x255"),
-        ("product_list_2x", "thumbnail__510x510"),
-    ],
-    "background_images": [("header_image", "thumbnail__1080x440")],
-    "user_avatars": [("default", "thumbnail__445x445")],
-}
-
-VERSATILEIMAGEFIELD_SETTINGS = {
-    # Images should be pre-generated on Production environment
-    "create_images_on_demand": get_bool_from_env("CREATE_IMAGES_ON_DEMAND", DEBUG)
-}
+elif AZURE_CONTAINER:
+    DEFAULT_FILE_STORAGE = "saleor.core.storages.AzureMediaStorage"
 
 PLACEHOLDER_IMAGES = {
-    60: "images/placeholder60x60.png",
-    120: "images/placeholder120x120.png",
-    255: "images/placeholder255x255.png",
-    540: "images/placeholder540x540.png",
-    1080: "images/placeholder1080x1080.png",
+    32: "images/placeholder32.png",
+    64: "images/placeholder64.png",
+    128: "images/placeholder128.png",
+    256: "images/placeholder256.png",
+    512: "images/placeholder512.png",
+    1024: "images/placeholder1024.png",
+    2048: "images/placeholder2048.png",
+    4096: "images/placeholder4096.png",
 }
-
-DEFAULT_PLACEHOLDER = "images/placeholder255x255.png"
 
 
 AUTHENTICATION_BACKENDS = [
@@ -492,6 +522,11 @@ EMPTY_CHECKOUTS_TIMEDELTA = timedelta(
     seconds=parse(os.environ.get("EMPTY_CHECKOUTS_TIMEDELTA", "6 hours"))
 )
 
+# Exports settings - defines after what time exported files will be deleted
+EXPORT_FILES_TIMEDELTA = timedelta(
+    seconds=parse(os.environ.get("EXPORT_FILES_TIMEDELTA", "30 days"))
+)
+
 # CELERY SETTINGS
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_BROKER_URL = (
@@ -502,7 +537,25 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", None)
+CELERY_TASK_ROUTES = {
+    "saleor.plugins.webhook.tasks.observability_reporter_task": {
+        "queue": "observability"
+    },
+    "saleor.plugins.webhook.tasks.observability_send_events": {
+        "queue": "observability"
+    },
+}
 
+# Defines after how many seconds should the task triggered by the Celery beat
+# entry 'update-products-search-vectors' expire if it wasn't picked up by a worker.
+BEAT_UPDATE_SEARCH_EXPIRE_AFTER_SEC = 20
+
+# Defines the Celery beat scheduler entries.
+#
+# Note: if a Celery task triggered by a Celery beat entry has an expiration
+# @task(expires=...), the Celery beat scheduler entry should also define
+# the expiration value. This makes sure if the task or scheduling is wrapped
+# by custom code (e.g., a Saleor fork), the expiration is still present.
 CELERY_BEAT_SCHEDULE = {
     "delete-empty-allocations": {
         "task": "saleor.warehouse.tasks.delete_empty_allocations_task",
@@ -528,21 +581,81 @@ CELERY_BEAT_SCHEDULE = {
         "task": "saleor.giftcard.tasks.deactivate_expired_cards_task",
         "schedule": crontab(hour=0, minute=0),
     },
+    "update-stocks-quantity-allocated": {
+        "task": "saleor.warehouse.tasks.update_stocks_quantity_allocated_task",
+        "schedule": crontab(hour=0, minute=0),
+    },
+    "delete-old-export-files": {
+        "task": "saleor.csv.tasks.delete_old_export_files",
+        "schedule": crontab(hour=1, minute=0),
+    },
+    "send-sale-toggle-notifications": {
+        "task": "saleor.discount.tasks.send_sale_toggle_notifications",
+        "schedule": initiated_sale_webhook_schedule,
+    },
+    "update-products-search-vectors": {
+        "task": "saleor.product.tasks.update_products_search_vector_task",
+        "schedule": timedelta(seconds=20),
+        "options": {"expires": BEAT_UPDATE_SEARCH_EXPIRE_AFTER_SEC},
+    },
 }
+
+# The maximum wait time between each is_due() call on schedulers
+# It needs to be higher than the frequency of the schedulers to avoid unnecessary
+# is_due() calls
+CELERY_BEAT_MAX_LOOP_INTERVAL = 300  # 5 minutes
 
 EVENT_PAYLOAD_DELETE_PERIOD = timedelta(
     seconds=parse(os.environ.get("EVENT_PAYLOAD_DELETE_PERIOD", "14 days"))
 )
 
+# Observability settings
+OBSERVABILITY_BROKER_URL = os.environ.get("OBSERVABILITY_BROKER_URL")
+OBSERVABILITY_ACTIVE = bool(OBSERVABILITY_BROKER_URL)
+OBSERVABILITY_REPORT_ALL_API_CALLS = get_bool_from_env(
+    "OBSERVABILITY_REPORT_ALL_API_CALLS", False
+)
+OBSERVABILITY_MAX_PAYLOAD_SIZE = int(
+    os.environ.get("OBSERVABILITY_MAX_PAYLOAD_SIZE", 25 * 1000)
+)
+OBSERVABILITY_BUFFER_SIZE_LIMIT = int(
+    os.environ.get("OBSERVABILITY_BUFFER_SIZE_LIMIT", 1000)
+)
+OBSERVABILITY_BUFFER_BATCH_SIZE = int(
+    os.environ.get("OBSERVABILITY_BUFFER_BATCH_SIZE", 100)
+)
+OBSERVABILITY_REPORT_PERIOD = timedelta(
+    seconds=parse(os.environ.get("OBSERVABILITY_REPORT_PERIOD", "20 seconds"))
+)
+OBSERVABILITY_BUFFER_TIMEOUT = timedelta(
+    seconds=parse(os.environ.get("OBSERVABILITY_BUFFER_TIMEOUT", "5 minutes"))
+)
+if OBSERVABILITY_ACTIVE:
+    CELERY_BEAT_SCHEDULE["observability-reporter"] = {
+        "task": "saleor.plugins.webhook.tasks.observability_reporter_task",
+        "schedule": OBSERVABILITY_REPORT_PERIOD,
+        "options": {"expires": OBSERVABILITY_REPORT_PERIOD.total_seconds()},
+    }
+    if OBSERVABILITY_BUFFER_TIMEOUT < OBSERVABILITY_REPORT_PERIOD * 2:
+        warnings.warn(
+            "OBSERVABILITY_REPORT_PERIOD is too big compared to "
+            "OBSERVABILITY_BUFFER_TIMEOUT. That can lead to a loss of events."
+        )
+
 # Change this value if your application is running behind a proxy,
 # e.g. HTTP_CF_Connecting_IP for Cloudflare or X_FORWARDED_FOR
-REAL_IP_ENVIRON = os.environ.get("REAL_IP_ENVIRON", "REMOTE_ADDR")
+REAL_IP_ENVIRON = get_list(os.environ.get("REAL_IP_ENVIRON", "REMOTE_ADDR"))
 
 # Slugs for menus precreated in Django migrations
 DEFAULT_MENUS = {"top_menu_name": "navbar", "bottom_menu_name": "footer"}
 
 # Slug for channel precreated in Django migrations
 DEFAULT_CHANNEL_SLUG = os.environ.get("DEFAULT_CHANNEL_SLUG", "default-channel")
+
+# Set this to `True` if you want to create default channel, warehouse, product type and
+# category during migrations. It makes it easier for the users to create their first
+# product.
+POPULATE_DEFAULTS = get_bool_from_env("POPULATE_DEFAULTS", True)
 
 
 #  Sentry
@@ -557,17 +670,18 @@ def SENTRY_INIT(dsn: str, sentry_opts: dict):
     Will only be called if SENTRY_DSN is not None, during core start, can be
     overriden in separate settings file.
     """
-    sentry_sdk.init(dsn, **sentry_opts)
+    sentry_sdk.init(dsn, release=__version__, **sentry_opts)
     ignore_logger("graphql.execution.utils")
+    ignore_logger("graphql.execution.executor")
 
 
-GRAPHENE = {
-    "RELAY_CONNECTION_ENFORCE_FIRST_OR_LAST": True,
-    "RELAY_CONNECTION_MAX_LIMIT": 100,
-}
+GRAPHQL_PAGINATION_LIMIT = 100
+GRAPHQL_MIDDLEWARE: List[str] = []
 
 # Set GRAPHQL_QUERY_MAX_COMPLEXITY=0 in env to disable (not recommended)
-GRAPHQL_QUERY_MAX_COMPLEXITY = int(os.environ.get("GRAPHQL_QUERY_MAX_COMPLEXITY", 250))
+GRAPHQL_QUERY_MAX_COMPLEXITY = int(
+    os.environ.get("GRAPHQL_QUERY_MAX_COMPLEXITY", 50000)
+)
 
 # Max number entities that can be requested in single query by Apollo Federation
 # Federation protocol implements no securities on its own part - malicious actor
@@ -577,7 +691,6 @@ FEDERATED_QUERY_MAX_ENTITIES = int(os.environ.get("FEDERATED_QUERY_MAX_ENTITIES"
 
 BUILTIN_PLUGINS = [
     "saleor.plugins.avatax.plugin.AvataxPlugin",
-    "saleor.plugins.vatlayer.plugin.VatlayerPlugin",
     "saleor.plugins.webhook.plugin.WebhookPlugin",
     "saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin",
     "saleor.payment.gateways.dummy_credit_card.plugin.DummyCreditCardGatewayPlugin",
@@ -587,10 +700,12 @@ BUILTIN_PLUGINS = [
     "saleor.payment.gateways.razorpay.plugin.RazorpayGatewayPlugin",
     "saleor.payment.gateways.adyen.plugin.AdyenGatewayPlugin",
     "saleor.payment.gateways.authorize_net.plugin.AuthorizeNetGatewayPlugin",
+    "saleor.payment.gateways.np_atobarai.plugin.NPAtobaraiGatewayPlugin",
     "saleor.plugins.invoicing.plugin.InvoicingPlugin",
     "saleor.plugins.user_email.plugin.UserEmailPlugin",
     "saleor.plugins.admin_email.plugin.AdminEmailPlugin",
     "saleor.plugins.sendgrid.plugin.SendgridEmailPlugin",
+    "saleor.plugins.openid_connect.plugin.OpenIDConnectPlugin",
 ]
 
 # Plugin discovery
@@ -619,6 +734,11 @@ if (
 # for getting response from the server.
 WEBHOOK_TIMEOUT = 10
 WEBHOOK_SYNC_TIMEOUT = 20
+
+# Since we split checkout complete logic into two separate transactions, in order to
+# mimic stock lock, we apply short reservation for the stocks. The value represents
+# time of the reservation in seconds.
+RESERVE_DURATION = 45
 
 # Initialize a simple and basic Jaeger Tracing integration
 # for open-tracing if enabled.
@@ -651,8 +771,7 @@ if REDIS_URL:
 CACHES = {"default": django_cache_url.config()}
 CACHES["default"]["TIMEOUT"] = parse(os.environ.get("CACHE_TIMEOUT", "7 days"))
 
-# Default False because storefront and dashboard don't support expiration of token
-JWT_EXPIRE = get_bool_from_env("JWT_EXPIRE", False)
+JWT_EXPIRE = True
 JWT_TTL_ACCESS = timedelta(seconds=parse(os.environ.get("JWT_TTL_ACCESS", "5 minutes")))
 JWT_TTL_APP_ACCESS = timedelta(
     seconds=parse(os.environ.get("JWT_TTL_APP_ACCESS", "5 minutes"))
@@ -664,12 +783,36 @@ JWT_TTL_REQUEST_EMAIL_CHANGE = timedelta(
     seconds=parse(os.environ.get("JWT_TTL_REQUEST_EMAIL_CHANGE", "1 hour")),
 )
 
-# Support multiple interface notation in schema for Apollo tooling.
+CHECKOUT_PRICES_TTL = timedelta(
+    seconds=parse(os.environ.get("CHECKOUT_PRICES_TTL", "1 hour"))
+)
 
-# In `graphql-core` V2 separator for interface is `,`.
-# Apollo tooling to generate TypeScript types using `&` as interfaces separator.
-# https://github.com/graphql-python/graphql-core-legacy/pull/258
-# https://github.com/graphql-python/graphql-core-legacy/issues/176
+# The maximum SearchVector expression count allowed per index SQL statement
+# If the count is exceeded, the expression list will be truncated
+INDEX_MAXIMUM_EXPR_COUNT = 4000
 
-assert hasattr(schema_printer, "_print_object")
-schema_printer._print_object = patched_print_object
+# Maximum related objects that can be indexed in an order
+SEARCH_ORDERS_MAX_INDEXED_PAYMENTS = 20
+SEARCH_ORDERS_MAX_INDEXED_DISCOUNTS = 20
+SEARCH_ORDERS_MAX_INDEXED_LINES = 100
+
+# Maximum related objects that can be indexed in a product
+PRODUCT_MAX_INDEXED_ATTRIBUTES = 1000
+PRODUCT_MAX_INDEXED_ATTRIBUTE_VALUES = 100
+PRODUCT_MAX_INDEXED_VARIANTS = 1000
+
+
+# Patch SubscriberExecutionContext class from `graphql-core-legacy` package
+# to fix bug causing not returning errors for subscription queries.
+
+executor.SubscriberExecutionContext = PatchedSubscriberExecutionContext  # type: ignore
+
+# Optional queue names for Celery tasks.
+# Set None to route to the default queue, or a string value to use a separate one
+#
+# Queue name for update search vector
+UPDATE_SEARCH_VECTOR_INDEX_QUEUE_NAME = os.environ.get(
+    "UPDATE_SEARCH_VECTOR_INDEX_QUEUE_NAME", None
+)
+# Queue name for "async webhook" events
+WEBHOOK_CELERY_QUEUE_NAME = os.environ.get("WEBHOOK_CELERY_QUEUE_NAME", None)

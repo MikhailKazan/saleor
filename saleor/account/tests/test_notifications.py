@@ -5,7 +5,9 @@ import pytest
 from freezegun import freeze_time
 
 from ...core.notify_events import NotifyEventType, UserNotifyEvent
+from ...core.tests.utils import get_site_context_payload
 from ...core.utils.url import prepare_url
+from ...graphql.core.utils import to_global_id_or_none
 from ...plugins.manager import get_plugins_manager
 from .. import notifications
 from ..notifications import get_default_user_payload
@@ -13,13 +15,13 @@ from ..notifications import get_default_user_payload
 
 def test_get_default_user_payload(customer_user):
     assert get_default_user_payload(customer_user) == {
-        "id": customer_user.id,
+        "id": to_global_id_or_none(customer_user),
         "email": customer_user.email,
         "first_name": customer_user.first_name,
         "last_name": customer_user.last_name,
         "is_staff": customer_user.is_staff,
         "is_active": customer_user.is_active,
-        "private_metadata": customer_user.private_metadata,
+        "private_metadata": {},
         "metadata": customer_user.metadata,
         "language_code": customer_user.language_code,
     }
@@ -51,9 +53,8 @@ def test_send_email_request_change(
         "redirect_url": f"{redirect_url}?token={token}",
         "old_email": customer_user.email,
         "new_email": new_email,
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
         "channel_slug": channel_PLN.slug,
+        **get_site_context_payload(site_settings.site),
     }
 
     mocked_notify.assert_called_once_with(
@@ -76,9 +77,8 @@ def test_send_email_changed_notification(
     expected_payload = {
         "user": get_default_user_payload(customer_user),
         "recipient_email": old_email,
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
         "channel_slug": channel_PLN.slug,
+        **get_site_context_payload(site_settings.site),
     }
 
     mocked_notify.assert_called_once_with(
@@ -113,9 +113,8 @@ def test_send_password_reset_notification(
         "recipient_email": customer_user.email,
         "token": token,
         "reset_url": reset_url,
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
         "channel_slug": channel_PLN.slug,
+        **get_site_context_payload(site_settings.site),
     }
     expected_event = (
         NotifyEventType.ACCOUNT_STAFF_RESET_PASSWORD

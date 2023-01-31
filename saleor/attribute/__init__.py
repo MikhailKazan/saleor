@@ -1,6 +1,3 @@
-default_app_config = "saleor.attribute.app.AttributeAppConfig"
-
-
 class AttributeInputType:
     """The type that we expect to render the attribute's values as."""
 
@@ -10,6 +7,7 @@ class AttributeInputType:
     REFERENCE = "reference"
     NUMERIC = "numeric"
     RICH_TEXT = "rich-text"
+    PLAIN_TEXT = "plain-text"
     SWATCH = "swatch"
     BOOLEAN = "boolean"
     DATE = "date"
@@ -22,6 +20,7 @@ class AttributeInputType:
         (REFERENCE, "Reference"),
         (NUMERIC, "Numeric"),
         (RICH_TEXT, "Rich Text"),
+        (PLAIN_TEXT, "Plain Text"),
         (SWATCH, "Swatch"),
         (BOOLEAN, "Boolean"),
         (DATE, "Date"),
@@ -38,11 +37,20 @@ class AttributeInputType:
     ]
 
     # list of the input types that are unique per instances
-    TYPES_WITH_UNIQUE_VALUES = [FILE, REFERENCE, RICH_TEXT, NUMERIC, DATE, DATE_TIME]
+    TYPES_WITH_UNIQUE_VALUES = [
+        FILE,
+        REFERENCE,
+        RICH_TEXT,
+        PLAIN_TEXT,
+        NUMERIC,
+        DATE,
+        DATE_TIME,
+    ]
 
     # list of the translatable attributes, excluding attributes with choices.
     TRANSLATABLE_ATTRIBUTES = [
         RICH_TEXT,
+        PLAIN_TEXT,
     ]
 
 
@@ -94,12 +102,16 @@ class AttributeType:
 class AttributeEntityType:
     """Type of a reference entity type. Must match the name of the graphql type.
 
-    After adding new value, `REFERENCE_VALUE_NAME_MAPPING`
-    and `ENTITY_TYPE_TO_MODEL_MAPPING` in saleor/graphql/attribute/utils.py
-    must be updated.
+    After adding a new value the `ENTITY_TYPE_MAPPING` in
+    saleor/graphql/attribute/utils.py must be updated.
     """
 
     PAGE = "Page"
     PRODUCT = "Product"
+    PRODUCT_VARIANT = "ProductVariant"
 
-    CHOICES = [(PAGE, "Page"), (PRODUCT, "Product")]
+    CHOICES = [
+        (PAGE, "Page"),
+        (PRODUCT, "Product"),
+        (PRODUCT_VARIANT, "Product Variant"),
+    ]

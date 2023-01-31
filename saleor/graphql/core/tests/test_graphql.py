@@ -1,19 +1,18 @@
 from functools import partial
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import graphene
 import pytest
-from django.contrib.auth.models import AnonymousUser
-from django.db.models import Q
-from django.shortcuts import reverse
+from django.urls import reverse
 from graphql.error import GraphQLError
 from graphql_relay import to_global_id
 
+from ....order import models as order_models
 from ...core.utils import from_global_id_or_error
+from ...order.types import Order
 from ...product.types import Product
 from ...tests.utils import get_graphql_content
 from ...utils import get_nodes
-from ...utils.filters import filter_by_query_param
 
 
 def test_middleware_dont_generate_sql_requests(client, settings, assert_num_queries):
@@ -52,7 +51,7 @@ def test_jwt_middleware(client, admin_user):
     response = api_client_post(data={"query": user_details_query})
     repl_data = response.json()
     assert response.status_code == 200
-    assert isinstance(response.wsgi_request.user, AnonymousUser)
+    assert not response.wsgi_request.user
     assert repl_data["data"]["me"] is None
 
     # test creating a token for admin user
@@ -80,7 +79,7 @@ def test_real_query(user_api_client, product, channel_USD):
     attr_value = product_attr.values.first()
     query = """
     query Root($categoryId: ID!, $sortBy: ProductOrder, $first: Int,
-            $attributesFilter: [AttributeInput], $channel: String) {
+            $attributesFilter: [AttributeInput!], $channel: String) {
 
         category(id: $categoryId) {
             ...CategoryPageFragmentQuery
@@ -271,17 +270,67 @@ def test_get_nodes(product_list):
     assert exc.value.args == (msg,)
 
 
-@patch("saleor.product.models.Product.objects")
-def test_filter_by_query_param(qs):
-    qs.filter.return_value = qs
+def test_get_nodes_for_order_with_int_id(order_list):
+    """Ensure that `get_nodes` returns correct nodes, when old id is used
+    for orders with the `use_old_id` flag set to True."""
+    order_models.Order.objects.update(use_old_id=True)
 
-    qs = filter_by_query_param(qs, "test", ["name", "force"])
-    test_kwargs = {"name__icontains": "test", "force__icontains": "test"}
-    q_objects = Q()
-    for q in test_kwargs:
-        q_objects |= Q(**{q: test_kwargs[q]})
-    # FIXME: django 1.11 fails on called_once_with(q_objects)
-    qs.filter.call_count == 1
+    # given
+    global_ids = [to_global_id("Order", order.number) for order in order_list]
+
+    # Make sure function works even if duplicated ids are provided
+    global_ids.append(to_global_id("Order", order_list[0].number))
+
+    # when
+    orders = get_nodes(global_ids, Order)
+
+    # then
+    assert orders == order_list
+
+
+def test_get_nodes_for_order_with_uuid_id(order_list):
+    """Ensure that `get_nodes` returns correct nodes, when the new uuid order id
+    is used."""
+    # given
+    global_ids = [to_global_id("Order", order.pk) for order in order_list]
+
+    # Make sure function works even if duplicated ids are provided
+    global_ids.append(to_global_id("Order", order_list[0].pk))
+
+    # when
+    orders = get_nodes(global_ids, Order)
+
+    # then
+    assert orders == order_list
+
+
+def test_get_nodes_for_order_with_int_id_and_use_old_id_set_to_false(order_list):
+    """Ensure that `get_nodes` does not return nodes, when old id is used
+    for orders with `use_old_id` flag set to False."""
+    # given
+    global_ids = [to_global_id("Order", order.number) for order in order_list]
+
+    # Make sure function works even if duplicated ids are provided
+    global_ids.append(to_global_id("Order", order_list[0].pk))
+
+    # when
+    with pytest.raises(AssertionError):
+        get_nodes(global_ids, Order)
+
+
+def test_get_nodes_for_order_with_uuid_and_int_id(order_list):
+    """Ensure that `get_nodes` returns correct nodes,
+    when old and new order id is provided."""
+    # given
+    order_models.Order.objects.update(use_old_id=True)
+    global_ids = [to_global_id("Order", order.pk) for order in order_list[:-1]]
+    global_ids.append(to_global_id("Order", order_list[-1].number))
+
+    # when
+    orders = get_nodes(global_ids, Order)
+
+    # then
+    assert orders == order_list
 
 
 def test_from_global_id_or_error(product):

@@ -3,17 +3,22 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
 
 import graphene
 from django.core.exceptions import ValidationError
+from django.db import DatabaseError, transaction
 from django.db.utils import IntegrityError
 
 from ...core.tracing import traced_atomic_transaction
 from ...order import OrderStatus
 from ...order import models as order_models
 from ...warehouse.models import Stock
+from ..core.enums import ProductErrorCode
 
 if TYPE_CHECKING:
-    from django.db.models import QuerySet
-
     from ...product.models import ProductVariant
+    from ...warehouse.models import Warehouse
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def get_used_attribute_values_for_variant(variant):
@@ -58,13 +63,16 @@ def get_used_variants_attribute_values(product):
     used_attribute_values = []
     for variant in variants:
         attribute_values = get_used_attribute_values_for_variant(variant)
-        used_attribute_values.append(attribute_values)
+        if attribute_values:
+            used_attribute_values.append(attribute_values)
     return used_attribute_values
 
 
 @traced_atomic_transaction()
 def create_stocks(
-    variant: "ProductVariant", stocks_data: List[Dict[str, str]], warehouses: "QuerySet"
+    variant: "ProductVariant",
+    stocks_data: List[Dict[str, str]],
+    warehouses: Iterable["Warehouse"],
 ):
     try:
         new_stocks = Stock.objects.bulk_create(
@@ -111,3 +119,25 @@ def clean_variant_sku(sku: Optional[str]) -> Optional[str]:
     if sku:
         return sku.strip() or None
     return None
+
+
+def update_ordered_media(ordered_media):
+    errors = defaultdict(list)
+    with transaction.atomic():
+        for order, media in enumerate(ordered_media):
+            media.sort_order = order
+            try:
+                media.save(update_fields=["sort_order"])
+            except DatabaseError as e:
+                msg = (
+                    f"Cannot update media for instance: {media}. "
+                    "Updating not existing object. "
+                    f"Details: {e}."
+                )
+                logger.warning(msg)
+                errors["media"].append(
+                    ValidationError(msg, code=ProductErrorCode.NOT_FOUND.value)
+                )
+
+    if errors:
+        raise ValidationError(errors)

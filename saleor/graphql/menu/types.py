@@ -1,8 +1,9 @@
 import graphene
 from graphene import relay
 
-from ...core.permissions import PagePermissions, has_one_of_permissions
 from ...menu import models
+from ...permission.enums import PagePermissions
+from ...permission.utils import has_one_of_permissions
 from ...product.models import ALL_PRODUCTS_PERMISSIONS
 from ..channel.dataloaders import ChannelBySlugLoader
 from ..channel.types import (
@@ -10,8 +11,9 @@ from ..channel.types import (
     ChannelContextType,
     ChannelContextTypeWithMetadata,
 )
+from ..core import ResolveInfo
 from ..core.connection import CountableConnection
-from ..core.types import ModelObjectType
+from ..core.types import NonNullList
 from ..meta.types import ObjectWithMetadata
 from ..page.dataloaders import PageByIdLoader
 from ..page.types import Page
@@ -32,11 +34,11 @@ from .dataloaders import (
 )
 
 
-class Menu(ChannelContextTypeWithMetadata, ModelObjectType):
+class Menu(ChannelContextTypeWithMetadata[models.Menu]):
     id = graphene.GlobalID(required=True)
     name = graphene.String(required=True)
     slug = graphene.String(required=True)
-    items = graphene.List(lambda: MenuItem)
+    items = NonNullList(lambda: MenuItem)
 
     class Meta:
         default_resolver = ChannelContextType.resolver_with_context
@@ -48,7 +50,7 @@ class Menu(ChannelContextTypeWithMetadata, ModelObjectType):
         model = models.Menu
 
     @staticmethod
-    def resolve_items(root: ChannelContext[models.Menu], info, **_kwargs):
+    def resolve_items(root: ChannelContext[models.Menu], info: ResolveInfo):
         menu_items = MenuItemsByParentMenuLoader(info.context).load(root.node.id)
         return menu_items.then(
             lambda menu_items: [
@@ -63,16 +65,30 @@ class MenuCountableConnection(CountableConnection):
         node = Menu
 
 
-class MenuItem(ChannelContextTypeWithMetadata, ModelObjectType):
+class MenuItem(ChannelContextTypeWithMetadata[models.MenuItem]):
     id = graphene.GlobalID(required=True)
     name = graphene.String(required=True)
     menu = graphene.Field(Menu, required=True)
     parent = graphene.Field(lambda: MenuItem)
     category = graphene.Field(Category)
-    collection = graphene.Field(Collection)
-    page = graphene.Field(Page)
+    collection = graphene.Field(
+        Collection,
+        description=(
+            "A collection associated with this menu item. Requires one of the "
+            "following permissions to include the unpublished items: "
+            f"{', '.join([p.name for p in ALL_PRODUCTS_PERMISSIONS])}."
+        ),
+    )
+    page = graphene.Field(
+        Page,
+        description=(
+            "A page associated with this menu item. Requires one of the following "
+            f"permissions to include unpublished items: "
+            f"{PagePermissions.MANAGE_PAGES.name}."
+        ),
+    )
     level = graphene.Int(required=True)
-    children = graphene.List(lambda: MenuItem)
+    children = NonNullList(lambda: MenuItem)
     url = graphene.String(description="URL to the menu item.")
     translation = TranslationField(
         MenuItemTranslation,
@@ -90,13 +106,13 @@ class MenuItem(ChannelContextTypeWithMetadata, ModelObjectType):
         model = models.MenuItem
 
     @staticmethod
-    def resolve_category(root: ChannelContext[models.MenuItem], info, **_kwargs):
+    def resolve_category(root: ChannelContext[models.MenuItem], info: ResolveInfo):
         if root.node.category_id:
             return CategoryByIdLoader(info.context).load(root.node.category_id)
         return None
 
     @staticmethod
-    def resolve_children(root: ChannelContext[models.MenuItem], info, **_kwargs):
+    def resolve_children(root: ChannelContext[models.MenuItem], info: ResolveInfo):
         menus = MenuItemChildrenLoader(info.context).load(root.node.id)
         return menus.then(
             lambda menus: [
@@ -106,7 +122,7 @@ class MenuItem(ChannelContextTypeWithMetadata, ModelObjectType):
         )
 
     @staticmethod
-    def resolve_collection(root: ChannelContext[models.MenuItem], info, **_kwargs):
+    def resolve_collection(root: ChannelContext[models.MenuItem], info: ResolveInfo):
         if not root.node.collection_id:
             return None
 
@@ -165,7 +181,7 @@ class MenuItem(ChannelContextTypeWithMetadata, ModelObjectType):
         )
 
     @staticmethod
-    def resolve_menu(root: ChannelContext[models.MenuItem], info, **_kwargs):
+    def resolve_menu(root: ChannelContext[models.MenuItem], info: ResolveInfo):
         if root.node.menu_id:
             menu = MenuByIdLoader(info.context).load(root.node.menu_id)
             return menu.then(
@@ -174,7 +190,7 @@ class MenuItem(ChannelContextTypeWithMetadata, ModelObjectType):
         return None
 
     @staticmethod
-    def resolve_parent(root: ChannelContext[models.MenuItem], info, **_kwargs):
+    def resolve_parent(root: ChannelContext[models.MenuItem], info: ResolveInfo):
         if root.node.parent_id:
             menu = MenuItemByIdLoader(info.context).load(root.node.parent_id)
             return menu.then(
@@ -183,11 +199,13 @@ class MenuItem(ChannelContextTypeWithMetadata, ModelObjectType):
         return None
 
     @staticmethod
-    def resolve_page(root: ChannelContext[models.MenuItem], info, **kwargs):
+    def resolve_page(root: ChannelContext[models.MenuItem], info: ResolveInfo):
         if root.node.page_id:
             requestor = get_user_or_app_from_context(info.context)
-            requestor_has_access_to_all = requestor.is_active and requestor.has_perm(
-                PagePermissions.MANAGE_PAGES
+            requestor_has_access_to_all = (
+                requestor
+                and requestor.is_active
+                and requestor.has_perm(PagePermissions.MANAGE_PAGES)
             )
             return (
                 PageByIdLoader(info.context)

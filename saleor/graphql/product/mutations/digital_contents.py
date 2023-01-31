@@ -1,14 +1,18 @@
 import graphene
 from django.core.exceptions import ValidationError
 
-from ....core.permissions import ProductPermissions
+from ....core.exceptions import PermissionDenied
+from ....permission.enums import ProductPermissions
 from ....product import models
 from ....product.error_codes import ProductErrorCode
 from ...channel import ChannelContext
+from ...core import ResolveInfo
+from ...core.context import set_mutation_flag_in_context
+from ...core.descriptions import ADDED_IN_38
 from ...core.mutations import BaseMutation, ModelMutation
-from ...core.types import Upload
-from ...core.types.common import ProductError
-from ...decorators import permission_required
+from ...core.types import NonNullList, ProductError, Upload
+from ...meta.mutations import MetadataInput
+from ...plugins.dataloaders import get_plugin_manager_promise
 from ..types import DigitalContent, DigitalContentUrl, ProductVariant
 
 
@@ -33,6 +37,21 @@ class DigitalContentInput(graphene.InputObjectType):
     )
     automatic_fulfillment = graphene.Boolean(
         description="Overwrite default automatic_fulfillment setting for variant.",
+        required=False,
+    )
+    metadata = NonNullList(
+        MetadataInput,
+        description=(
+            "Fields required to update the digital content metadata." + ADDED_IN_38
+        ),
+        required=False,
+    )
+    private_metadata = NonNullList(
+        MetadataInput,
+        description=(
+            "Fields required to update the digital content private metadata."
+            + ADDED_IN_38
+        ),
         required=False,
     )
 
@@ -64,10 +83,12 @@ class DigitalContentCreate(BaseMutation):
         )
         error_type_class = ProductError
         error_type_field = "product_errors"
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        support_meta_field = True
+        support_private_meta_field = True
 
     @classmethod
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def clean_input(cls, info, data, instance):
+    def clean_input(cls, info: ResolveInfo, data, instance):
         if hasattr(instance, "digital_content"):
             instance.digital_content.delete()
 
@@ -86,19 +107,20 @@ class DigitalContentCreate(BaseMutation):
             if missing_fields:
                 msg += "{}, " * len(missing_fields)
                 raise ValidationError(
-                    msg.format(*missing_fields), code=ProductErrorCode.REQUIRED
+                    msg.format(*missing_fields), code=ProductErrorCode.REQUIRED.value
                 )
 
         return data
 
     @classmethod
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def perform_mutation(cls, _root, info, variant_id, **data):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, input, variant_id: str
+    ):
         variant = cls.get_node_or_error(
-            info, variant_id, "id", only_type=ProductVariant
+            info, variant_id, field="id", only_type=ProductVariant
         )
 
-        clean_input = cls.clean_input(info, data.get("input"), variant)
+        clean_input = cls.clean_input(info, input, variant)
 
         content_data = info.context.FILES.get(clean_input["content_file"])
         digital_content = models.DigitalContent(content_file=content_data)
@@ -110,6 +132,12 @@ class DigitalContentCreate(BaseMutation):
         digital_content.url_valid_days = clean_input.get("url_valid_days")
         digital_content.automatic_fulfillment = clean_input.get(
             "automatic_fulfillment", False
+        )
+        metadata_list = clean_input.pop("metadata", None)
+        private_metadata_list = clean_input.pop("private_metadata", None)
+
+        cls.validate_and_update_metadata(
+            digital_content, metadata_list, private_metadata_list
         )
 
         variant.digital_content = digital_content
@@ -124,7 +152,7 @@ class DigitalContentDelete(BaseMutation):
 
     class Arguments:
         variant_id = graphene.ID(
-            description=("ID of a product variant with digital content to remove."),
+            description="ID of a product variant with digital content to remove.",
             required=True,
         )
 
@@ -132,12 +160,24 @@ class DigitalContentDelete(BaseMutation):
         description = "Remove digital content assigned to given variant."
         error_type_class = ProductError
         error_type_field = "product_errors"
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
 
     @classmethod
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def mutate(cls, _root, info, variant_id):
+    def mutate(  # type: ignore[override]
+        cls, root, info: ResolveInfo, /, *, variant_id: str
+    ):
+        set_mutation_flag_in_context(info.context)
+        if not cls.check_permissions(info.context):
+            raise PermissionDenied(permissions=cls._meta.permissions)
+        manager = get_plugin_manager_promise(info.context).get()
+        result = manager.perform_mutation(
+            mutation_cls=cls, root=root, info=info, data={"variant_id": variant_id}
+        )
+        if result is not None:
+            return result
+
         variant = cls.get_node_or_error(
-            info, variant_id, "id", only_type=ProductVariant
+            info, variant_id, field="id", only_type=ProductVariant
         )
 
         if hasattr(variant, "digital_content"):
@@ -153,7 +193,7 @@ class DigitalContentUpdate(BaseMutation):
 
     class Arguments:
         variant_id = graphene.ID(
-            description=("ID of a product variant with digital content to update."),
+            description="ID of a product variant with digital content to update.",
             required=True,
         )
         input = DigitalContentInput(
@@ -164,10 +204,12 @@ class DigitalContentUpdate(BaseMutation):
         description = "Update digital content."
         error_type_class = ProductError
         error_type_field = "product_errors"
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        support_meta_field = True
+        support_private_meta_field = True
 
     @classmethod
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def clean_input(cls, info, data):
+    def clean_input(cls, info: ResolveInfo, data):
         use_default_settings = data.get("use_default_settings")
         if use_default_settings:
             return {"use_default_settings": use_default_settings}
@@ -183,29 +225,30 @@ class DigitalContentUpdate(BaseMutation):
             if missing_fields:
                 msg += "{}, " * len(missing_fields)
                 raise ValidationError(
-                    msg.format(*missing_fields), code=ProductErrorCode.REQUIRED
+                    msg.format(*missing_fields), code=ProductErrorCode.REQUIRED.value
                 )
 
         return data
 
     @classmethod
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def perform_mutation(cls, _root, info, variant_id, **data):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, input, variant_id
+    ):
         variant = cls.get_node_or_error(
-            info, variant_id, "id", only_type=ProductVariant
+            info, variant_id, field="id", only_type=ProductVariant
         )
 
         if not hasattr(variant, "digital_content"):
-            msg = "Variant %s doesn't have any digital content" % variant.id
+            msg = f"Variant {variant.id} doesn't have any digital content"
             raise ValidationError(
                 {
                     "variantId": ValidationError(
-                        msg, code=ProductErrorCode.VARIANT_NO_DIGITAL_CONTENT
+                        msg, code=ProductErrorCode.VARIANT_NO_DIGITAL_CONTENT.value
                     )
                 }
             )
 
-        clean_input = cls.clean_input(info, data.get("input"))
+        clean_input = cls.clean_input(info, input)
 
         digital_content = variant.digital_content
 
@@ -217,6 +260,13 @@ class DigitalContentUpdate(BaseMutation):
         digital_content.url_valid_days = clean_input.get("url_valid_days")
         digital_content.automatic_fulfillment = clean_input.get(
             "automatic_fulfillment", False
+        )
+
+        metadata_list = clean_input.pop("metadata", None)
+        private_metadata_list = clean_input.pop("private_metadata", None)
+
+        cls.validate_and_update_metadata(
+            digital_content, metadata_list, private_metadata_list
         )
 
         variant.digital_content = digital_content
@@ -246,8 +296,4 @@ class DigitalContentUrlCreate(ModelMutation):
         object_type = DigitalContentUrl
         error_type_class = ProductError
         error_type_field = "product_errors"
-
-    @classmethod
-    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
-    def mutate(cls, root, info, **data):
-        return super().mutate(root, info, **data)
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)

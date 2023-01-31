@@ -1,14 +1,23 @@
 import base64
 from unittest.mock import patch
 
+import before_after
 import graphene
 import pytest
 from django.core.exceptions import ValidationError
+from django.db import transaction
 
+from ....account.error_codes import AccountErrorCode
+from ....account.models import User
+from ....app.models import App
+from ....checkout.models import Checkout
 from ....core.error_codes import MetadataErrorCode
+from ....core.jwt import create_access_token_for_app
 from ....core.models import ModelWithMetadata
 from ....invoice.models import Invoice
+from ....payment.models import TransactionItem
 from ....payment.utils import payment_owned_by_user
+from ...tests.fixtures import ApiClient
 from ...tests.utils import assert_no_permission, get_graphql_content
 
 PRIVATE_KEY = "private_key"
@@ -52,6 +61,7 @@ def execute_update_public_metadata_for_item(
     item_type,
     key=PUBLIC_KEY,
     value=PUBLIC_VALUE,
+    ignore_errors=False,
 ):
     variables = {
         "id": item_id,
@@ -63,7 +73,7 @@ def execute_update_public_metadata_for_item(
         variables,
         permissions=[permissions] if permissions else None,
     )
-    response = get_graphql_content(response)
+    response = get_graphql_content(response, ignore_errors=ignore_errors)
     return response
 
 
@@ -124,14 +134,19 @@ def item_contains_multiple_proper_public_metadata(
     )
 
 
-def invalid_id_graphql_error_raised(errors_from_respone):
-    return all(
-        [
-            len(errors_from_respone) == 1,
-            errors_from_respone[0]["code"] == MetadataErrorCode.GRAPHQL_ERROR.name,
-            errors_from_respone[0]["field"] == "id",
-        ]
+def test_meta_mutations_handle_validation_errors(staff_api_client):
+    invalid_id = "6QjoLs5LIqb3At7hVKKcUlqXceKkFK"
+    variables = {
+        "id": invalid_id,
+        "input": [{"key": "year", "value": "of-saleor"}],
+    }
+    response = staff_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Checkout", variables
     )
+    content = get_graphql_content(response)
+    errors = content["data"]["updateMetadata"]["errors"]
+    assert errors
+    assert errors[0]["code"] == MetadataErrorCode.INVALID.name
 
 
 @patch("saleor.plugins.manager.PluginsManager.checkout_updated")
@@ -142,10 +157,11 @@ def test_base_metadata_mutation_handles_errors_from_extra_action(
     error_field = "field"
     error_msg = "boom"
     mock_checkout_updated.side_effect = ValidationError({error_field: error_msg})
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
     response = execute_update_public_metadata_for_item(
-        api_client, None, checkout.token, "Checkout"
+        api_client, None, checkout_id, "Checkout"
     )
 
     # then
@@ -185,6 +201,23 @@ def test_add_public_metadata_for_customer_as_app(
     # then
     assert item_contains_proper_public_metadata(
         response["data"]["updateMetadata"]["item"], customer_user, customer_id
+    )
+
+
+def test_change_metadata_for_non_existing_user(app_api_client, customer_user):
+    # given the non-existing user ID
+    last_id = User.objects.order_by("id").values_list("id", flat=True).last()
+    customer_id = graphene.Node.to_global_id("User", last_id + 100)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        app_api_client, [], customer_id, "User"
+    )
+
+    # then
+    assert (
+        response["data"]["updateMetadata"]["errors"][0]["code"]
+        == AccountErrorCode.NOT_FOUND.name
     )
 
 
@@ -350,7 +383,24 @@ def test_add_public_metadata_for_checkout(api_client, checkout):
 
     # then
     assert item_contains_proper_public_metadata(
-        response["data"]["updateMetadata"]["item"], checkout, checkout_id
+        response["data"]["updateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
+    )
+
+
+def test_add_public_metadata_for_checkout_line(api_client, checkout_line):
+    # given
+    checkout_line_id = graphene.Node.to_global_id("CheckoutLine", checkout_line.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        api_client, None, checkout_line_id, "CheckoutLine"
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"], checkout_line, checkout_line_id
     )
 
 
@@ -365,7 +415,9 @@ def test_add_public_metadata_for_checkout_by_token(api_client, checkout):
 
     # then
     assert item_contains_proper_public_metadata(
-        response["data"]["updateMetadata"]["item"], checkout, checkout_id
+        response["data"]["updateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
     )
 
 
@@ -396,8 +448,9 @@ def test_add_public_metadata_for_order_by_id(api_client, order):
     )
 
     # then
-    errors = response["data"]["updateMetadata"]["errors"]
-    assert invalid_id_graphql_error_raised(errors)
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"], order, order_id
+    )
 
 
 def test_add_public_metadata_for_order_by_token(api_client, order):
@@ -406,7 +459,7 @@ def test_add_public_metadata_for_order_by_token(api_client, order):
 
     # when
     response = execute_update_public_metadata_for_item(
-        api_client, None, order.token, "Order"
+        api_client, None, order.id, "Order"
     )
 
     # then
@@ -425,8 +478,9 @@ def test_add_public_metadata_for_draft_order_by_id(api_client, draft_order):
     )
 
     # then
-    errors = response["data"]["updateMetadata"]["errors"]
-    assert invalid_id_graphql_error_raised(errors)
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"], draft_order, draft_order_id
+    )
 
 
 def test_add_public_metadata_for_draft_order_by_token(api_client, draft_order):
@@ -435,12 +489,27 @@ def test_add_public_metadata_for_draft_order_by_token(api_client, draft_order):
 
     # when
     response = execute_update_public_metadata_for_item(
-        api_client, None, draft_order.token, "Order"
+        api_client, None, draft_order.id, "Order"
     )
 
     # then
     assert item_contains_proper_public_metadata(
         response["data"]["updateMetadata"]["item"], draft_order, draft_order_id
+    )
+
+
+def test_add_public_metadata_for_order_line(api_client, order_line):
+    # given
+    order_line_id = graphene.Node.to_global_id("OrderLine", order_line.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        api_client, None, order_line_id, "OrderLine"
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"], order_line, order_line_id
     )
 
 
@@ -634,6 +703,110 @@ def test_add_public_metadata_for_app(staff_api_client, permission_manage_apps, a
     )
 
 
+def test_add_public_metadata_for_app_by_different_app(
+    app_api_client, permission_manage_apps, app, payment_app
+):
+    # given
+    app_id = graphene.Node.to_global_id("App", payment_app.pk)
+    app_api_client.app = app
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        app_api_client,
+        permission_manage_apps,
+        app_id,
+        "App",
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"], payment_app, app_id
+    )
+
+
+def test_add_public_metadata_for_app_that_is_owner(
+    app_api_client, permission_manage_apps, app
+):
+    # given
+    app_id = graphene.Node.to_global_id("App", app.pk)
+    app_api_client.app = app
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        app_api_client,
+        None,
+        app_id,
+        "App",
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"], app, app_id
+    )
+
+
+def test_add_public_metadata_for_app_by_staff_without_permissions(
+    staff_api_client, app
+):
+    # given
+    app_id = graphene.Node.to_global_id("App", app.pk)
+    variables = {
+        "id": app_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "App", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_add_public_metadata_for_app_with_app_user_token(app, staff_user):
+    # given
+    token = create_access_token_for_app(app, staff_user)
+    api_client = ApiClient(user=staff_user)
+    api_client.token = token
+    app_id = graphene.Node.to_global_id("App", app.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        api_client,
+        None,
+        app_id,
+        "App",
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"], app, app_id
+    )
+
+
+def test_add_public_metadata_for_unrelated_app_by_app_user_token(staff_user, app):
+    # given
+    token = create_access_token_for_app(app, staff_user)
+    api_client = ApiClient(user=staff_user)
+    api_client.token = token
+    second_app = App.objects.create(name="Sample app", is_active=True)
+    app_id = graphene.Node.to_global_id("App", second_app.pk)
+
+    variables = {
+        "id": app_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "App", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
 def test_add_public_metadata_for_page(staff_api_client, permission_manage_pages, page):
     # given
     page_id = graphene.Node.to_global_id("Page", page.pk)
@@ -742,8 +915,8 @@ def test_add_public_metadata_for_menu_item(
 
 def test_update_public_metadata_for_item(api_client, checkout):
     # given
-    checkout.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
-    checkout.save(update_fields=["metadata"])
+    checkout.metadata_storage.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout.metadata_storage.save(update_fields=["metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
@@ -754,9 +927,77 @@ def test_update_public_metadata_for_item(api_client, checkout):
     # then
     assert item_contains_proper_public_metadata(
         response["data"]["updateMetadata"]["item"],
-        checkout,
+        checkout.metadata_storage,
         checkout_id,
         value="NewMetaValue",
+    )
+
+
+def test_update_public_metadata_for_checkout_line(api_client, checkout_line):
+    # given
+    checkout_line.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout_line.save(update_fields=["metadata"])
+    checkout_line_id = graphene.Node.to_global_id("CheckoutLine", checkout_line.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        api_client, None, checkout_line_id, "CheckoutLine", value="NewMetaValue"
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"],
+        checkout_line,
+        checkout_line_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_public_metadata_for_order_line(api_client, order_line):
+    # given
+    order_line.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    order_line.save(update_fields=["metadata"])
+    order_line_id = graphene.Node.to_global_id("OrderLine", order_line.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        api_client, None, order_line_id, "OrderLine", value="NewMetaValue"
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"],
+        order_line,
+        order_line_id,
+        value="NewMetaValue",
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_public_metadata_for_item_on_deleted_instance(api_client, checkout):
+    checkout.metadata_storage.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout.metadata_storage.save(update_fields=["metadata"])
+
+    def delete_checkout_object(*args, **kwargs):
+        with transaction.atomic():
+            Checkout.objects.filter(pk=checkout.pk).delete()
+
+    with before_after.before(
+        "saleor.graphql.meta.mutations._save_instance", delete_checkout_object
+    ):
+        response = execute_update_public_metadata_for_item(
+            api_client,
+            None,
+            checkout.token,
+            "Checkout",
+            value="NewMetaValue",
+            ignore_errors=True,
+        )
+
+    assert not Checkout.objects.filter(pk=checkout.pk).first()
+    assert (
+        response["data"]["updateMetadata"]["errors"][0]["code"]
+        == MetadataErrorCode.NOT_FOUND.name
     )
 
 
@@ -778,16 +1019,19 @@ def test_update_public_metadata_for_non_exist_item(
     assert errors[0]["code"] == MetadataErrorCode.NOT_FOUND.name
 
 
-def test_update_public_metadata_for_item_without_meta(api_client, address):
+def test_update_public_metadata_for_item_without_meta(
+    api_client, permission_group_manage_users
+):
     # given
-    assert not issubclass(type(address), ModelWithMetadata)
-    address_id = graphene.Node.to_global_id("Address", address.pk)
+    group = permission_group_manage_users
+    assert not issubclass(type(group), ModelWithMetadata)
+    group_id = graphene.Node.to_global_id("Group", group.pk)
 
     # when
     # We use "User" type inside mutation for valid graphql query with fragment
     # without this we are not able to reuse UPDATE_PUBLIC_METADATA_MUTATION
     response = execute_update_public_metadata_for_item(
-        api_client, None, address_id, "User"
+        api_client, None, group_id, "User"
     )
 
     # then
@@ -893,6 +1137,281 @@ def test_add_public_metadata_for_gift_card(
     )
 
 
+def test_update_public_metadata_for_customer_address_by_logged_user(
+    user_api_client, address
+):
+    # given
+    user = user_api_client.user
+    user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        user_api_client, None, address_id, "Address", value="NewMetaValue"
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"],
+        address,
+        address_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_public_metadata_for_customer_address_by_different_logged_user(
+    user2_api_client, customer_user
+):
+    # given
+    address = customer_user.addresses.first()
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = user2_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_public_metadata_for_customer_address_by_staff_with_perm(
+    staff_api_client, customer_user, permission_manage_users
+):
+    # given
+    address = customer_user.addresses.first()
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        staff_api_client,
+        permission_manage_users,
+        address_id,
+        "Address",
+        value="NewMetaValue",
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"],
+        address,
+        address_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_public_metadata_for_customer_address_by_app_with_perm(
+    app_api_client, customer_user, permission_manage_users
+):
+    # given
+    address = customer_user.addresses.first()
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        app_api_client,
+        permission_manage_users,
+        address_id,
+        "Address",
+        value="NewMetaValue",
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"],
+        address,
+        address_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_public_metadata_for_address_by_non_logged_user(
+    api_client, customer_user
+):
+    # given
+    address = customer_user.addresses.first()
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+    variables = {
+        "id": address_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_public_metadata_for_staff_address_by_staff_with_perm(
+    staff_api_client, address, staff_users, permission_manage_staff
+):
+    # given
+    user = staff_users[-1]
+    user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        staff_api_client,
+        permission_manage_staff,
+        address_id,
+        "Address",
+        value="NewMetaValue",
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"],
+        address,
+        address_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_public_metadata_for_staff_address_by_staff_without_perm(
+    staff_api_client, address, staff_users
+):
+    # given
+    user = staff_users[-1]
+    user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_public_metadata_for_staff_address_by_customer(
+    user_api_client, address, staff_users
+):
+    # given
+    user = staff_users[-1]
+    user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = user_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_public_metadata_for_staff_address_by_app_with_perm(
+    app_api_client, staff_user, address, permission_manage_staff
+):
+    # given
+    staff_user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_staff],
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_public_metadata_for_staff_address_by_app_without_perm(
+    app_api_client, staff_user, address
+):
+    # given
+    staff_user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Address", variables
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_public_metadata_for_warehouse_address_by_staff(
+    staff_api_client, warehouse, permission_manage_staff
+):
+    # given
+    address = warehouse.address
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_staff],
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_public_metadata_for_site_settings_address_by_staff(
+    staff_api_client, site_settings, address, permission_manage_staff
+):
+    # given
+    site_settings.company_address = address
+    site_settings.save(update_fields=["company_address"])
+
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_PUBLIC_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_staff],
+    )
+
+    # then
+    assert_no_permission(response)
+
+
 DELETE_PUBLIC_METADATA_MUTATION = """
 mutation DeletePublicMetadata($id: ID!, $keys: [String!]!) {
     deleteMetadata(
@@ -928,7 +1447,6 @@ def execute_clear_public_metadata_for_item(
         "id": item_id,
         "keys": [key],
     }
-
     response = client.post_graphql(
         DELETE_PUBLIC_METADATA_MUTATION % item_type,
         variables,
@@ -1128,8 +1646,8 @@ def test_delete_public_metadata_for_myself_as_staff(staff_api_client):
 
 def test_delete_public_metadata_for_checkout(api_client, checkout):
     # given
-    checkout.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
-    checkout.save(update_fields=["metadata"])
+    checkout.metadata_storage.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout.metadata_storage.save(update_fields=["metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
@@ -1139,14 +1657,16 @@ def test_delete_public_metadata_for_checkout(api_client, checkout):
 
     # then
     assert item_without_public_metadata(
-        response["data"]["deleteMetadata"]["item"], checkout, checkout_id
+        response["data"]["deleteMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
     )
 
 
 def test_delete_public_metadata_for_checkout_by_token(api_client, checkout):
     # given
-    checkout.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
-    checkout.save(update_fields=["metadata"])
+    checkout.metadata_storage.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout.metadata_storage.save(update_fields=["metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
@@ -1156,7 +1676,26 @@ def test_delete_public_metadata_for_checkout_by_token(api_client, checkout):
 
     # then
     assert item_without_public_metadata(
-        response["data"]["deleteMetadata"]["item"], checkout, checkout_id
+        response["data"]["deleteMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
+    )
+
+
+def test_delete_public_metadata_for_checkout_line(api_client, checkout_line):
+    # given
+    checkout_line.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout_line.save(update_fields=["metadata"])
+    checkout_line_id = graphene.Node.to_global_id("CheckoutLine", checkout_line.pk)
+
+    # when
+    response = execute_clear_public_metadata_for_item(
+        api_client, None, checkout_line_id, "CheckoutLine"
+    )
+
+    # then
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], checkout_line, checkout_line_id
     )
 
 
@@ -1172,8 +1711,9 @@ def test_delete_public_metadata_for_order_by_id(api_client, order):
     )
 
     # then
-    errors = response["data"]["deleteMetadata"]["errors"]
-    assert invalid_id_graphql_error_raised(errors)
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], order, order_id
+    )
 
 
 def test_delete_public_metadata_for_order_by_token(api_client, order):
@@ -1184,7 +1724,7 @@ def test_delete_public_metadata_for_order_by_token(api_client, order):
 
     # when
     response = execute_clear_public_metadata_for_item(
-        api_client, None, order.token, "Order"
+        api_client, None, order.id, "Order"
     )
 
     # then
@@ -1205,10 +1745,9 @@ def test_delete_public_metadata_for_draft_order_by_id(api_client, draft_order):
     )
 
     # then
-    errors = response["data"]["deleteMetadata"]["errors"]
-    assert len(errors) == 1
-    assert errors[0]["code"] == MetadataErrorCode.GRAPHQL_ERROR.name
-    assert errors[0]["field"] == "id"
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], draft_order, draft_order_id
+    )
 
 
 def test_delete_public_metadata_for_draft_order_by_token(api_client, draft_order):
@@ -1219,12 +1758,29 @@ def test_delete_public_metadata_for_draft_order_by_token(api_client, draft_order
 
     # when
     response = execute_clear_public_metadata_for_item(
-        api_client, None, draft_order.token, "Order"
+        api_client, None, draft_order.id, "Order"
     )
 
     # then
     assert item_without_public_metadata(
         response["data"]["deleteMetadata"]["item"], draft_order, draft_order_id
+    )
+
+
+def test_delete_public_metadata_for_order_line(api_client, order_line):
+    # given
+    order_line.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    order_line.save(update_fields=["metadata"])
+    order_line_id = graphene.Node.to_global_id("OrderLine", order_line.pk)
+
+    # when
+    response = execute_clear_public_metadata_for_item(
+        api_client, None, order_line_id, "OrderLine"
+    )
+
+    # then
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], order_line, order_line_id
     )
 
 
@@ -1574,16 +2130,19 @@ def test_delete_public_metadata_for_non_exist_item(
     assert errors[0]["code"] == MetadataErrorCode.NOT_FOUND.name
 
 
-def test_delete_public_metadata_for_item_without_meta(api_client, address):
+def test_delete_public_metadata_for_item_without_meta(
+    api_client, permission_group_manage_users
+):
     # given
-    assert not issubclass(type(address), ModelWithMetadata)
-    address_id = graphene.Node.to_global_id("Address", address.pk)
+    group = permission_group_manage_users
+    assert not issubclass(type(group), ModelWithMetadata)
+    group_id = graphene.Node.to_global_id("Group", group.pk)
 
     # when
     # We use "User" type inside mutation for valid graphql query with fragment
     # without this we are not able to reuse DELETE_PUBLIC_METADATA_MUTATION
     response = execute_clear_public_metadata_for_item(
-        api_client, None, address_id, "User"
+        api_client, None, group_id, "User"
     )
 
     # then
@@ -1594,41 +2153,45 @@ def test_delete_public_metadata_for_item_without_meta(api_client, address):
 
 def test_delete_public_metadata_for_not_exist_key(api_client, checkout):
     # given
-    checkout.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
-    checkout.save(update_fields=["metadata"])
+    checkout.metadata_storage.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout.metadata_storage.save(update_fields=["metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
     response = execute_clear_public_metadata_for_item(
-        api_client, None, checkout.token, "Checkout", key="Not-exits"
+        api_client, None, checkout_id, "Checkout", key="Not-exits"
     )
 
     # then
     assert item_contains_proper_public_metadata(
-        response["data"]["deleteMetadata"]["item"], checkout, checkout_id
+        response["data"]["deleteMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
     )
 
 
 def test_delete_public_metadata_for_one_key(api_client, checkout):
     # given
-    checkout.store_value_in_metadata(
+    checkout.metadata_storage.store_value_in_metadata(
         {PUBLIC_KEY: PUBLIC_VALUE, "to_clear": PUBLIC_VALUE},
     )
-    checkout.save(update_fields=["metadata"])
+    checkout.metadata_storage.save(update_fields=["metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
     response = execute_clear_public_metadata_for_item(
-        api_client, None, checkout.token, "Checkout", key="to_clear"
+        api_client, None, checkout_id, "Checkout", key="to_clear"
     )
 
     # then
     assert item_contains_proper_public_metadata(
-        response["data"]["deleteMetadata"]["item"], checkout, checkout_id
+        response["data"]["deleteMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
     )
     assert item_without_public_metadata(
         response["data"]["deleteMetadata"]["item"],
-        checkout,
+        checkout.metadata_storage,
         checkout_id,
         key="to_clear",
     )
@@ -1946,7 +2509,28 @@ def test_add_private_metadata_for_checkout(
 
     # then
     assert item_contains_proper_private_metadata(
-        response["data"]["updatePrivateMetadata"]["item"], checkout, checkout_id
+        response["data"]["updatePrivateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
+    )
+
+
+def test_add_private_metadata_for_checkout_line(
+    staff_api_client, checkout_line, permission_manage_checkouts
+):
+    # given
+    checkout_line_id = graphene.Node.to_global_id("CheckoutLine", checkout_line.pk)
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        staff_api_client, permission_manage_checkouts, checkout_line_id, "CheckoutLine"
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        checkout_line,
+        checkout_line_id,
     )
 
 
@@ -1963,7 +2547,9 @@ def test_add_private_metadata_for_checkout_by_token(
 
     # then
     assert item_contains_proper_private_metadata(
-        response["data"]["updatePrivateMetadata"]["item"], checkout, checkout_id
+        response["data"]["updatePrivateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
     )
 
 
@@ -1979,8 +2565,9 @@ def test_add_private_metadata_for_order_by_id(
     )
 
     # then
-    errors = response["data"]["updatePrivateMetadata"]["errors"]
-    assert invalid_id_graphql_error_raised(errors)
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"], order, order_id
+    )
 
 
 def test_add_private_metadata_for_order_by_token(
@@ -1991,7 +2578,7 @@ def test_add_private_metadata_for_order_by_token(
 
     # when
     response = execute_update_private_metadata_for_item(
-        staff_api_client, permission_manage_orders, order.token, "Order"
+        staff_api_client, permission_manage_orders, order.id, "Order"
     )
 
     # then
@@ -2012,8 +2599,9 @@ def test_add_private_metadata_for_draft_order_by_id(
     )
 
     # then
-    errors = response["data"]["updatePrivateMetadata"]["errors"]
-    assert invalid_id_graphql_error_raised(errors)
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"], draft_order, draft_order_id
+    )
 
 
 def test_add_private_metadata_for_draft_order_by_token(
@@ -2024,12 +2612,29 @@ def test_add_private_metadata_for_draft_order_by_token(
 
     # when
     response = execute_update_private_metadata_for_item(
-        staff_api_client, permission_manage_orders, draft_order.token, "Order"
+        staff_api_client, permission_manage_orders, draft_order.id, "Order"
     )
 
     # then
     assert item_contains_proper_private_metadata(
         response["data"]["updatePrivateMetadata"]["item"], draft_order, draft_order_id
+    )
+
+
+def test_add_private_metadata_for_order_line(
+    staff_api_client, order_line, permission_manage_orders
+):
+    # given
+    order_line_id = graphene.Node.to_global_id("OrderLine", order_line.pk)
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        staff_api_client, permission_manage_orders, order_line_id, "OrderLine"
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"], order_line, order_line_id
     )
 
 
@@ -2230,6 +2835,75 @@ def test_add_private_metadata_for_app(staff_api_client, permission_manage_apps, 
     )
 
 
+def test_add_private_metadata_for_app_by_different_app(
+    app_api_client, permission_manage_apps, app, payment_app
+):
+    # given
+    app_id = graphene.Node.to_global_id("App", payment_app.pk)
+    app_api_client.app = app
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        app_api_client,
+        permission_manage_apps,
+        app_id,
+        "App",
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        payment_app,
+        app_id,
+    )
+
+
+def test_add_private_metadata_for_app_with_app_user_token(
+    staff_user, permission_manage_apps, app, payment_app
+):
+    # given
+    token = create_access_token_for_app(app, staff_user)
+    api_client = ApiClient(user=staff_user)
+    api_client.token = token
+    app_id = graphene.Node.to_global_id("App", app.pk)
+
+    variables = {
+        "id": app_id,
+        "input": [{"key": PUBLIC_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "App", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_add_private_metadata_by_app_that_is_owner(
+    app_api_client, permission_manage_apps, app
+):
+    # given
+    app_id = graphene.Node.to_global_id("App", app.pk)
+    app_api_client.app = app
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        app_api_client,
+        None,
+        app_id,
+        "App",
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        app,
+        app_id,
+    )
+
+
 def test_add_private_metadata_for_page(staff_api_client, permission_manage_pages, page):
     # given
     page_id = graphene.Node.to_global_id("Page", page.pk)
@@ -2342,8 +3016,10 @@ def test_update_private_metadata_for_item(
     staff_api_client, checkout, permission_manage_checkouts
 ):
     # given
-    checkout.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_KEY})
-    checkout.save(update_fields=["private_metadata"])
+    checkout.metadata_storage.store_value_in_private_metadata(
+        {PRIVATE_KEY: PRIVATE_KEY}
+    )
+    checkout.metadata_storage.save(update_fields=["private_metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
@@ -2358,7 +3034,7 @@ def test_update_private_metadata_for_item(
     # then
     assert item_contains_proper_private_metadata(
         response["data"]["updatePrivateMetadata"]["item"],
-        checkout,
+        checkout.metadata_storage,
         checkout_id,
         value="NewMetaValue",
     )
@@ -2382,16 +3058,19 @@ def test_update_private_metadata_for_non_exist_item(
     assert errors[0]["code"] == MetadataErrorCode.NOT_FOUND.name
 
 
-def test_update_private_metadata_for_item_without_meta(api_client, address):
+def test_update_private_metadata_for_item_without_meta(
+    api_client, permission_group_manage_users
+):
     # given
-    assert not issubclass(type(address), ModelWithMetadata)
-    address_id = graphene.Node.to_global_id("Address", address.pk)
+    group = permission_group_manage_users
+    assert not issubclass(type(group), ModelWithMetadata)
+    group_id = graphene.Node.to_global_id("Group", group.pk)
 
     # when
     # We use "User" type inside mutation for valid graphql query with fragment
     # without this we are not able to reuse UPDATE_PRIVATE_METADATA_MUTATION
     response = execute_update_private_metadata_for_item(
-        api_client, None, address_id, "User"
+        api_client, None, group_id, "User"
     )
 
     # then
@@ -2503,6 +3182,58 @@ def test_update_private_metadata_by_customer(user_api_client, payment):
     assert_no_permission(response)
 
 
+def test_update_private_metadata_for_checkout_line(
+    staff_api_client, checkout_line, permission_manage_checkouts
+):
+    # given
+    checkout_line.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout_line.save(update_fields=["private_metadata"])
+    checkout_line_id = graphene.Node.to_global_id("CheckoutLine", checkout_line.pk)
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        staff_api_client,
+        permission_manage_checkouts,
+        checkout_line_id,
+        "CheckoutLine",
+        value="NewMetaValue",
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        checkout_line,
+        checkout_line_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_private_metadata_for_order_line(
+    staff_api_client, order_line, permission_manage_orders
+):
+    # given
+    order_line.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    order_line.save(update_fields=["private_metadata"])
+    order_line_id = graphene.Node.to_global_id("OrderLine", order_line.pk)
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        staff_api_client,
+        permission_manage_orders,
+        order_line_id,
+        "OrderLine",
+        value="NewMetaValue",
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        order_line,
+        order_line_id,
+        value="NewMetaValue",
+    )
+
+
 def test_add_private_metadata_for_warehouse(
     staff_api_client, permission_manage_products, warehouse
 ):
@@ -2535,6 +3266,281 @@ def test_add_private_metadata_for_gift_card(
     assert item_contains_proper_private_metadata(
         response["data"]["updatePrivateMetadata"]["item"], gift_card, gift_card_id
     )
+
+
+def test_update_private_metadata_for_customer_address_by_logged_user(
+    user_api_client, address
+):
+    # given
+    user = user_api_client.user
+    user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = user_api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_private_metadata_for_customer_address_by_different_logged_user(
+    user2_api_client, customer_user
+):
+    # given
+    address = customer_user.addresses.first()
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = user2_api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_private_metadata_for_customer_address_by_staff_with_perm(
+    staff_api_client, customer_user, permission_manage_users
+):
+    # given
+    address = customer_user.addresses.first()
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        staff_api_client,
+        permission_manage_users,
+        address_id,
+        "Address",
+        value="NewMetaValue",
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        address,
+        address_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_private_metadata_for_customer_address_by_app_with_perm(
+    app_api_client, customer_user, permission_manage_users
+):
+    # given
+    address = customer_user.addresses.first()
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        app_api_client,
+        permission_manage_users,
+        address_id,
+        "Address",
+        value="NewMetaValue",
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        address,
+        address_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_private_metadata_for_address_by_non_logged_user(
+    api_client, customer_user
+):
+    # given
+    address = customer_user.addresses.first()
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_private_metadata_for_staff_address_by_staff_with_perm(
+    staff_api_client, address, staff_users, permission_manage_staff
+):
+    # given
+    user = staff_users[-1]
+    user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        staff_api_client,
+        permission_manage_staff,
+        address_id,
+        "Address",
+        value="NewMetaValue",
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        address,
+        address_id,
+        value="NewMetaValue",
+    )
+
+
+def test_update_private_metadata_for_staff_address_by_staff_without_perm(
+    staff_api_client, address, staff_users
+):
+    # given
+    user = staff_users[-1]
+    user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_private_metadata_for_staff_address_by_customer(
+    user_api_client, address, staff_users
+):
+    # given
+    user = staff_users[-1]
+    user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = user_api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address", variables, permissions=None
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_private_metadata_for_staff_address_by_app_with_perm(
+    app_api_client, staff_user, address, permission_manage_staff
+):
+    # given
+    staff_user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_staff],
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_private_metadata_for_staff_address_by_app_without_perm(
+    app_api_client, staff_user, address
+):
+    # given
+    staff_user.addresses.add(address)
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address", variables
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_private_metadata_for_warehouse_address_by_staff(
+    staff_api_client, warehouse, permission_manage_staff
+):
+    # given
+    address = warehouse.address
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_staff],
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_update_private_metadata_for_site_settings_address_by_staff(
+    staff_api_client, site_settings, address, permission_manage_staff
+):
+    # given
+    site_settings.company_address = address
+    site_settings.save(update_fields=["company_address"])
+
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    variables = {
+        "id": address_id,
+        "input": [{"key": PRIVATE_KEY, "value": "NewMetaValue"}],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_PRIVATE_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_staff],
+    )
+
+    # then
+    assert_no_permission(response)
 
 
 DELETE_PRIVATE_METADATA_MUTATION = """
@@ -2780,8 +3786,10 @@ def test_delete_private_metadata_for_checkout(
     staff_api_client, checkout, permission_manage_checkouts
 ):
     # given
-    checkout.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
-    checkout.save(update_fields=["private_metadata"])
+    checkout.metadata_storage.store_value_in_private_metadata(
+        {PRIVATE_KEY: PRIVATE_VALUE}
+    )
+    checkout.metadata_storage.save(update_fields=["private_metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
@@ -2791,7 +3799,9 @@ def test_delete_private_metadata_for_checkout(
 
     # then
     assert item_without_private_metadata(
-        response["data"]["deletePrivateMetadata"]["item"], checkout, checkout_id
+        response["data"]["deletePrivateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
     )
 
 
@@ -2799,8 +3809,10 @@ def test_delete_private_metadata_for_checkout_by_token(
     staff_api_client, checkout, permission_manage_checkouts
 ):
     # given
-    checkout.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
-    checkout.save(update_fields=["private_metadata"])
+    checkout.metadata_storage.store_value_in_private_metadata(
+        {PRIVATE_KEY: PRIVATE_VALUE}
+    )
+    checkout.metadata_storage.save(update_fields=["private_metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
@@ -2810,7 +3822,30 @@ def test_delete_private_metadata_for_checkout_by_token(
 
     # then
     assert item_without_private_metadata(
-        response["data"]["deletePrivateMetadata"]["item"], checkout, checkout_id
+        response["data"]["deletePrivateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
+    )
+
+
+def test_delete_private_metadata_for_checkout_line(
+    staff_api_client, checkout_line, permission_manage_checkouts
+):
+    # given
+    checkout_line.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
+    checkout_line.save(update_fields=["private_metadata"])
+    checkout_line_id = graphene.Node.to_global_id("CheckoutLine", checkout_line.pk)
+
+    # when
+    response = execute_clear_private_metadata_for_item(
+        staff_api_client, permission_manage_checkouts, checkout_line_id, "CheckoutLine"
+    )
+
+    # then
+    assert item_without_private_metadata(
+        response["data"]["deletePrivateMetadata"]["item"],
+        checkout_line,
+        checkout_line_id,
     )
 
 
@@ -2828,8 +3863,9 @@ def test_delete_private_metadata_for_order_by_id(
     )
 
     # then
-    errors = response["data"]["deletePrivateMetadata"]["errors"]
-    assert invalid_id_graphql_error_raised(errors)
+    assert item_without_private_metadata(
+        response["data"]["deletePrivateMetadata"]["item"], order, order_id
+    )
 
 
 def test_delete_private_metadata_for_order_by_token(
@@ -2842,7 +3878,7 @@ def test_delete_private_metadata_for_order_by_token(
 
     # when
     response = execute_clear_private_metadata_for_item(
-        staff_api_client, permission_manage_orders, order.token, "Order"
+        staff_api_client, permission_manage_orders, order.id, "Order"
     )
 
     # then
@@ -2865,8 +3901,9 @@ def test_delete_private_metadata_for_draft_order_by_id(
     )
 
     # then
-    errors = response["data"]["deletePrivateMetadata"]["errors"]
-    assert invalid_id_graphql_error_raised(errors)
+    assert item_without_private_metadata(
+        response["data"]["deletePrivateMetadata"]["item"], draft_order, draft_order_id
+    )
 
 
 def test_delete_private_metadata_for_draft_order_by_token(
@@ -2879,12 +3916,31 @@ def test_delete_private_metadata_for_draft_order_by_token(
 
     # when
     response = execute_clear_private_metadata_for_item(
-        staff_api_client, permission_manage_orders, draft_order.token, "Order"
+        staff_api_client, permission_manage_orders, draft_order.id, "Order"
     )
 
     # then
     assert item_without_private_metadata(
         response["data"]["deletePrivateMetadata"]["item"], draft_order, draft_order_id
+    )
+
+
+def test_delete_private_metadata_for_order_line(
+    staff_api_client, order_line, permission_manage_orders
+):
+    # given
+    order_line.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
+    order_line.save(update_fields=["private_metadata"])
+    order_line_id = graphene.Node.to_global_id("OrderLine", order_line.pk)
+
+    # when
+    response = execute_clear_private_metadata_for_item(
+        staff_api_client, permission_manage_orders, order_line_id, "OrderLine"
+    )
+
+    # then
+    assert item_without_private_metadata(
+        response["data"]["deletePrivateMetadata"]["item"], order_line, order_line_id
     )
 
 
@@ -3242,16 +4298,19 @@ def test_delete_private_metadata_for_non_exist_item(
     assert errors[0]["code"] == MetadataErrorCode.NOT_FOUND.name
 
 
-def test_delete_private_metadata_for_item_without_meta(api_client, address):
+def test_delete_private_metadata_for_item_without_meta(
+    api_client, permission_group_manage_users
+):
     # given
-    assert not issubclass(type(address), ModelWithMetadata)
-    address_id = graphene.Node.to_global_id("Address", address.pk)
+    group = permission_group_manage_users
+    assert not issubclass(type(group), ModelWithMetadata)
+    group_id = graphene.Node.to_global_id("Group", group.pk)
 
     # when
     # We use "User" type inside mutation for valid graphql query with fragment
     # without this we are not able to reuse DELETE_PRIVATE_METADATA_MUTATION
     response = execute_clear_private_metadata_for_item(
-        api_client, None, address_id, "User"
+        api_client, None, group_id, "User"
     )
 
     # then
@@ -3264,8 +4323,10 @@ def test_delete_private_metadata_for_not_exist_key(
     staff_api_client, checkout, permission_manage_checkouts
 ):
     # given
-    checkout.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
-    checkout.save(update_fields=["private_metadata"])
+    checkout.metadata_storage.store_value_in_private_metadata(
+        {PRIVATE_KEY: PRIVATE_VALUE}
+    )
+    checkout.metadata_storage.save(update_fields=["private_metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
@@ -3279,7 +4340,9 @@ def test_delete_private_metadata_for_not_exist_key(
 
     # then
     assert item_contains_proper_private_metadata(
-        response["data"]["deletePrivateMetadata"]["item"], checkout, checkout_id
+        response["data"]["deletePrivateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
     )
 
 
@@ -3287,10 +4350,10 @@ def test_delete_private_metadata_for_one_key(
     staff_api_client, checkout, permission_manage_checkouts
 ):
     # given
-    checkout.store_value_in_private_metadata(
+    checkout.metadata_storage.store_value_in_private_metadata(
         {PRIVATE_KEY: PRIVATE_VALUE, "to_clear": PRIVATE_VALUE},
     )
-    checkout.save(update_fields=["private_metadata"])
+    checkout.metadata_storage.save(update_fields=["private_metadata"])
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     # when
@@ -3304,11 +4367,13 @@ def test_delete_private_metadata_for_one_key(
 
     # then
     assert item_contains_proper_private_metadata(
-        response["data"]["deletePrivateMetadata"]["item"], checkout, checkout_id
+        response["data"]["deletePrivateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
     )
     assert item_without_private_metadata(
         response["data"]["deletePrivateMetadata"]["item"],
-        checkout,
+        checkout.metadata_storage,
         checkout_id,
         key="to_clear",
     )
@@ -3424,6 +4489,236 @@ def test_delete_private_metadata_for_sale(
     )
 
 
+def test_delete_private_metadata_for_customer_address_as_staff(
+    staff_api_client, permission_manage_users, customer_user
+):
+    # given
+    address = customer_user.addresses.first()
+    address.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
+    address.save(update_fields=["private_metadata"])
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_clear_private_metadata_for_item(
+        staff_api_client, permission_manage_users, address_id, "Address"
+    )
+
+    # then
+    assert item_without_private_metadata(
+        response["data"]["deletePrivateMetadata"]["item"], address, address_id
+    )
+
+
+def test_delete_private_metadata_for_customer_address_as_app(
+    app_api_client, permission_manage_users, customer_user
+):
+    # given
+    address = customer_user.addresses.first()
+    address.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
+    address.save(update_fields=["private_metadata"])
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_clear_private_metadata_for_item(
+        app_api_client, permission_manage_users, address_id, "Address"
+    )
+
+    # then
+    assert item_without_private_metadata(
+        response["data"]["deletePrivateMetadata"]["item"], address, address_id
+    )
+
+
+def test_delete_private_metadata_for_staff_address_as_staff(
+    staff_api_client, address, permission_manage_staff
+):
+    # given
+    staff_user = staff_api_client.user
+    staff_user.addresses.add(address)
+    address.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
+    address.save(update_fields=["private_metadata"])
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_clear_private_metadata_for_item(
+        staff_api_client, permission_manage_staff, address_id, "Address"
+    )
+
+    # then
+    assert item_without_private_metadata(
+        response["data"]["deletePrivateMetadata"]["item"], address, address_id
+    )
+
+
+def test_delete_private_metadata_for_staff_address_as_app(
+    app_api_client, staff_user, address, permission_manage_staff
+):
+    # given
+    staff_user.addresses.add(address)
+    address.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
+    address.save(update_fields=["private_metadata"])
+    variables = {
+        "id": graphene.Node.to_global_id("Address", address.pk),
+        "keys": [PRIVATE_KEY],
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        DELETE_PRIVATE_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_staff],
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_delete_private_metadata_for_myself_address_as_staff_no_permission(
+    staff_api_client, address, permission_manage_users
+):
+    # given
+    staff = staff_api_client.user
+    staff.addresses.add(address)
+    staff.store_value_in_private_metadata({PRIVATE_KEY: PRIVATE_VALUE})
+    staff.save(update_fields=["private_metadata"])
+    variables = {
+        "id": graphene.Node.to_global_id("Address", address.pk),
+        "keys": [PRIVATE_KEY],
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        DELETE_PRIVATE_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_users],
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_delete_public_metadata_for_customer_address_as_staff(
+    staff_api_client, permission_manage_users, customer_user
+):
+    # given
+    address = customer_user.addresses.first()
+    address.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    address.save(update_fields=["metadata"])
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_clear_public_metadata_for_item(
+        staff_api_client, permission_manage_users, address_id, "Address"
+    )
+
+    # then
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], address, address_id
+    )
+
+
+def test_delete_public_metadata_for_customer_address_as_app(
+    app_api_client, permission_manage_users, customer_user
+):
+    # given
+    address = customer_user.addresses.first()
+    address.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    address.save(update_fields=["metadata"])
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_clear_public_metadata_for_item(
+        app_api_client, permission_manage_users, address_id, "Address"
+    )
+
+    # then
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], address, address_id
+    )
+
+
+def test_delete_public_metadata_for_staff_address_as_another_staff(
+    staff_api_client, staff_users, address, permission_manage_staff
+):
+    # given
+    staff_user = staff_users[-1]
+    staff_user.addresses.add(address)
+    address.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    address.save(update_fields=["metadata"])
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_clear_public_metadata_for_item(
+        staff_api_client, permission_manage_staff, address_id, "Address"
+    )
+
+    # then
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], address, address_id
+    )
+
+
+def test_delete_public_metadata_for_staff_address_as_staff(staff_api_client, address):
+    # given
+    staff_user = staff_api_client.user
+    staff_user.addresses.add(address)
+    address.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    address.save(update_fields=["metadata"])
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_clear_public_metadata_for_item(
+        staff_api_client, None, address_id, "Address"
+    )
+
+    # then
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], address, address_id
+    )
+
+
+def test_delete_public_metadata_for_staff_address_as_app(
+    app_api_client, staff_user, address, permission_manage_staff
+):
+    # given
+    staff_user.addresses.add(address)
+    address.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    address.save(update_fields=["metadata"])
+    variables = {
+        "id": graphene.Node.to_global_id("Address", address.pk),
+        "keys": [PUBLIC_KEY],
+    }
+
+    # when
+    response = app_api_client.post_graphql(
+        DELETE_PUBLIC_METADATA_MUTATION % "Address",
+        variables,
+        permissions=[permission_manage_staff],
+    )
+
+    # then
+    assert_no_permission(response)
+
+
+def test_delete_public_metadata_for_myself_address(staff_api_client, address):
+    # given
+    staff = staff_api_client.user
+    staff.addresses.add(address)
+    address.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    staff.save(update_fields=["metadata"])
+    address_id = graphene.Node.to_global_id("Address", address.pk)
+
+    # when
+    response = execute_clear_public_metadata_for_item(
+        staff_api_client, None, address_id, "Address"
+    )
+
+    # then
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], address, address_id
+    )
+
+
 def test_add_public_metadata_for_voucher(
     staff_api_client, permission_manage_discounts, voucher
 ):
@@ -3493,4 +4788,87 @@ def test_delete_private_metadata_for_voucher(
     # then
     assert item_without_private_metadata(
         response["data"]["deletePrivateMetadata"]["item"], voucher, voucher_id
+    )
+
+
+def test_add_public_metadata_for_transaction_item(
+    staff_api_client,
+    permission_manage_payments,
+):
+    # given
+    transaction_item = TransactionItem.objects.create()
+    transaction_id = graphene.Node.to_global_id("TransactionItem", transaction_item.pk)
+
+    # when
+    response = execute_update_public_metadata_for_item(
+        staff_api_client, permission_manage_payments, transaction_id, "TransactionItem"
+    )
+
+    # then
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"], transaction_item, transaction_id
+    )
+
+
+def test_delete_public_metadata_for_transaction_item(
+    staff_api_client, permission_manage_payments
+):
+    # given
+    transaction_item = TransactionItem.objects.create(
+        metadata={PUBLIC_KEY: PUBLIC_VALUE}
+    )
+    transaction_id = graphene.Node.to_global_id("TransactionItem", transaction_item.pk)
+
+    # when
+    response = execute_clear_public_metadata_for_item(
+        staff_api_client, permission_manage_payments, transaction_id, "TransactionItem"
+    )
+
+    # then
+    assert item_without_public_metadata(
+        response["data"]["deleteMetadata"]["item"], transaction_item, transaction_id
+    )
+
+
+def test_add_private_metadata_for_transaction_item(
+    staff_api_client, permission_manage_payments
+):
+    # given
+    transaction_item = TransactionItem.objects.create(
+        private_metadata={PRIVATE_KEY: PRIVATE_VALUE}
+    )
+    transaction_id = graphene.Node.to_global_id("TransactionItem", transaction_item.pk)
+
+    # when
+    response = execute_update_private_metadata_for_item(
+        staff_api_client, permission_manage_payments, transaction_id, "TransactionItem"
+    )
+
+    # then
+    assert item_contains_proper_private_metadata(
+        response["data"]["updatePrivateMetadata"]["item"],
+        transaction_item,
+        transaction_id,
+    )
+
+
+def test_delete_private_metadata_for_transaction_item(
+    staff_api_client, permission_manage_payments, voucher
+):
+    # given
+    transaction_item = TransactionItem.objects.create(
+        private_metadata={PRIVATE_KEY: PRIVATE_VALUE}
+    )
+    transaction_id = graphene.Node.to_global_id("TransactionItem", transaction_item.pk)
+
+    # when
+    response = execute_clear_private_metadata_for_item(
+        staff_api_client, permission_manage_payments, transaction_id, "TransactionItem"
+    )
+
+    # then
+    assert item_without_private_metadata(
+        response["data"]["deletePrivateMetadata"]["item"],
+        transaction_item,
+        transaction_id,
     )

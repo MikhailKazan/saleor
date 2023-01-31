@@ -1,7 +1,10 @@
+from datetime import datetime
 from decimal import Decimal
 from functools import partial
 from typing import TYPE_CHECKING, Optional
+from uuid import uuid4
 
+import pytz
 from django.conf import settings
 from django.contrib.postgres.indexes import GinIndex
 from django.db import models
@@ -10,13 +13,12 @@ from django.utils import timezone
 from django_countries.fields import CountryField
 from django_prices.models import MoneyField
 from django_prices.templatetags.prices import amount
-from prices import Money, TaxedMoney, fixed_discount, percentage_discount
+from prices import Money, fixed_discount, percentage_discount
 
 from ..channel.models import Channel
 from ..core.models import ModelWithMetadata
-from ..core.permissions import DiscountPermissions
-from ..core.taxes import display_gross_prices
 from ..core.utils.translations import Translation, TranslationProxy
+from ..permission.enums import DiscountPermissions
 from . import DiscountValueType, OrderDiscountType, VoucherType
 
 if TYPE_CHECKING:
@@ -38,7 +40,7 @@ class NotApplicable(ValueError):
         self.min_checkout_items_quantity = min_checkout_items_quantity
 
 
-class VoucherQueryset(models.QuerySet):
+class VoucherQueryset(models.QuerySet["Voucher"]):
     def active(self, date):
         return self.filter(
             Q(usage_limit__isnull=True) | Q(used__lt=F("usage_limit")),
@@ -56,6 +58,9 @@ class VoucherQueryset(models.QuerySet):
         return self.filter(
             Q(used__gte=F("usage_limit")) | Q(end_date__lt=date), start_date__lt=date
         )
+
+
+VoucherManager = models.Manager.from_queryset(VoucherQueryset)
 
 
 class Voucher(ModelWithMetadata):
@@ -89,18 +94,11 @@ class Voucher(ModelWithMetadata):
     collections = models.ManyToManyField("product.Collection", blank=True)
     categories = models.ManyToManyField("product.Category", blank=True)
 
-    objects = models.Manager.from_queryset(VoucherQueryset)()
+    objects = VoucherManager()
     translated = TranslationProxy()
 
     class Meta:
         ordering = ("code",)
-
-    @property
-    def is_free(self):
-        return (
-            self.discount_value == Decimal(100)
-            and self.discount_value_type == DiscountValueType.PERCENTAGE
-        )
 
     def get_discount(self, channel: Channel):
         """Return proper discount amount for given channel.
@@ -134,8 +132,7 @@ class Voucher(ModelWithMetadata):
             return price
         return price - after_discount
 
-    def validate_min_spent(self, value: TaxedMoney, channel: Channel):
-        value = value.gross if display_gross_prices() else value.net
+    def validate_min_spent(self, value: Money, channel: Channel):
         voucher_channel_listing = self.channel_listings.filter(channel=channel).first()
         if not voucher_channel_listing:
             raise NotApplicable("This voucher is not assigned to this channel")
@@ -220,7 +217,7 @@ class VoucherCustomer(models.Model):
         unique_together = (("voucher", "customer_email"),)
 
 
-class SaleQueryset(models.QuerySet):
+class SaleQueryset(models.QuerySet["Sale"]):
     def active(self, date=None):
         if date is None:
             date = timezone.now()
@@ -251,6 +248,9 @@ class VoucherTranslation(Translation):
         return {"name": self.name}
 
 
+SaleManager = models.Manager.from_queryset(SaleQueryset)
+
+
 class Sale(ModelWithMetadata):
     name = models.CharField(max_length=255)
     type = models.CharField(
@@ -264,8 +264,12 @@ class Sale(ModelWithMetadata):
     variants = models.ManyToManyField("product.ProductVariant", blank=True)
     start_date = models.DateTimeField(default=timezone.now)
     end_date = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
 
-    objects = models.Manager.from_queryset(SaleQueryset)()
+    notification_sent_datetime = models.DateTimeField(null=True, blank=True)
+
+    objects = SaleManager()
     translated = TranslationProxy()
 
     class Meta:
@@ -279,10 +283,7 @@ class Sale(ModelWithMetadata):
         )
 
     def __repr__(self):
-        return "Sale(name=%r, type=%s)" % (
-            str(self.name),
-            self.get_type_display(),
-        )
+        return f"Sale(name={str(self.name)}, type={self.get_type_display()})"
 
     def __str__(self):
         return self.name
@@ -301,6 +302,11 @@ class Sale(ModelWithMetadata):
                 percentage=sale_channel_listing.discount_value,
             )
         raise NotImplementedError("Unknown discount type")
+
+    def is_active(self, date=None):
+        if date is None:
+            date = datetime.now(pytz.utc)
+        return (not self.end_date or self.end_date >= date) and self.start_date <= date
 
 
 class SaleChannelListing(models.Model):
@@ -321,7 +327,7 @@ class SaleChannelListing(models.Model):
     discount_value = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
-        default=0,
+        default=Decimal("0.0"),
     )
     currency = models.CharField(
         max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH,
@@ -350,6 +356,9 @@ class SaleTranslation(Translation):
 
 
 class OrderDiscount(models.Model):
+    id = models.UUIDField(primary_key=True, editable=False, unique=True, default=uuid4)
+    old_id = models.PositiveIntegerField(unique=True, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
     order = models.ForeignKey(
         "order.Order",
         related_name="discounts",
@@ -370,13 +379,13 @@ class OrderDiscount(models.Model):
     value = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
-        default=0,
+        default=Decimal("0.0"),
     )
 
     amount_value = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
-        default=0,
+        default=Decimal("0.0"),
     )
     amount = MoneyField(amount_field="amount_value", currency_field="currency")
     currency = models.CharField(
@@ -390,3 +399,4 @@ class OrderDiscount(models.Model):
     class Meta:
         # Orders searching index
         indexes = [GinIndex(fields=["name", "translated_name"])]
+        ordering = ("created_at", "id")

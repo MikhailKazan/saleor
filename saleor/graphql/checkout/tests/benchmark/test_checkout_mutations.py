@@ -12,7 +12,9 @@ from .....checkout.utils import add_variants_to_checkout, set_external_shipping_
 from .....plugins.manager import get_plugins_manager
 from .....product.models import ProductVariant, ProductVariantChannelListing
 from .....warehouse.models import Stock
+from ....core.utils import to_global_id_or_none
 from ....tests.utils import get_graphql_content
+from ...mutations.utils import CheckoutLineData
 
 FRAGMENT_PRICE = """
     fragment Price on TaxedMoney {
@@ -169,6 +171,7 @@ FRAGMENT_CHECKOUT = (
           discountName
           translatedDiscountName
           voucherCode
+          displayGrossPrices
         }
     """
 )
@@ -317,66 +320,6 @@ def test_create_checkout(
 
 @pytest.mark.django_db
 @pytest.mark.count_queries(autouse=False)
-def test_create_checkout_for_cc(
-    api_client,
-    graphql_address_data,
-    channel_USD,
-    stocks_for_cc,
-    product_variant_list,
-    count_queries,
-):
-    query = (
-        FRAGMENT_CHECKOUT_FOR_CC
-        + """
-            mutation CreateCheckout($checkoutInput: CheckoutCreateInput!) {
-              checkoutCreate(input: $checkoutInput) {
-                errors {
-                  field
-                  message
-                }
-                checkout {
-                  ...Checkout
-                }
-              }
-            }
-        """
-    )
-    checkout_counts = Checkout.objects.count()
-    variables = {
-        "checkoutInput": {
-            "channel": channel_USD.slug,
-            "email": "test@example.com",
-            "shippingAddress": graphql_address_data,
-            "lines": [
-                {
-                    "quantity": 1,
-                    "variantId": Node.to_global_id(
-                        "ProductVariant", stocks_for_cc[0].product_variant.pk
-                    ),
-                },
-                {
-                    "quantity": 2,
-                    "variantId": Node.to_global_id(
-                        "ProductVariant",
-                        product_variant_list[0].pk,
-                    ),
-                },
-                {
-                    "quantity": 5,
-                    "variantId": Node.to_global_id(
-                        "ProductVariant",
-                        product_variant_list[1].pk,
-                    ),
-                },
-            ],
-        }
-    }
-    get_graphql_content(api_client.post_graphql(query, variables))
-    assert checkout_counts + 1 == Checkout.objects.count()
-
-
-@pytest.mark.django_db
-@pytest.mark.count_queries(autouse=False)
 def test_create_checkout_with_reservations(
     site_settings_with_reservations,
     api_client,
@@ -447,7 +390,7 @@ def test_create_checkout_with_reservations(
         }
     }
 
-    with django_assert_num_queries(54):
+    with django_assert_num_queries(65):
         response = api_client.post_graphql(query, variables)
         assert get_graphql_content(response)["data"]["checkoutCreate"]
         assert Checkout.objects.first().lines.count() == 1
@@ -465,7 +408,7 @@ def test_create_checkout_with_reservations(
         }
     }
 
-    with django_assert_num_queries(54):
+    with django_assert_num_queries(65):
         response = api_client.post_graphql(query, variables)
         assert get_graphql_content(response)["data"]["checkoutCreate"]
         assert Checkout.objects.first().lines.count() == 10
@@ -483,10 +426,10 @@ def test_add_shipping_to_checkout(
         FRAGMENT_CHECKOUT
         + """
             mutation updateCheckoutShippingOptions(
-              $token: UUID, $shippingMethodId: ID!
+              $id: ID, $shippingMethodId: ID!
             ) {
               checkoutShippingMethodUpdate(
-                token: $token, shippingMethodId: $shippingMethodId
+                id: $id, shippingMethodId: $shippingMethodId
               ) {
                 errors {
                   field
@@ -500,7 +443,7 @@ def test_add_shipping_to_checkout(
         """
     )
     variables = {
-        "token": checkout_with_shipping_address.token,
+        "id": to_global_id_or_none(checkout_with_shipping_address),
         "shippingMethodId": Node.to_global_id("ShippingMethod", shipping_method.pk),
     }
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -511,18 +454,18 @@ def test_add_shipping_to_checkout(
 @pytest.mark.count_queries(autouse=False)
 def test_add_delivery_to_checkout(
     api_client,
-    checkout_with_shipping_address_for_cc,
-    warehouses_for_cc,
+    checkout_with_item_for_cc,
+    warehouse_for_cc,
     count_queries,
 ):
     query = (
         FRAGMENT_CHECKOUT
         + """
             mutation updateCheckoutDeliveryOptions(
-              $token: UUID, $deliveryMethodId: ID
+              $id: ID, $deliveryMethodId: ID
             ) {
               checkoutDeliveryMethodUpdate(
-                token: $token, deliveryMethodId: $deliveryMethodId
+                id: $id, deliveryMethodId: $deliveryMethodId
               ) {
                 errors {
                   field
@@ -536,8 +479,8 @@ def test_add_delivery_to_checkout(
         """
     )
     variables = {
-        "token": checkout_with_shipping_address_for_cc.token,
-        "deliveryMethodId": Node.to_global_id("Warehouse", warehouses_for_cc[1].pk),
+        "id": to_global_id_or_none(checkout_with_item_for_cc),
+        "deliveryMethodId": Node.to_global_id("Warehouse", warehouse_for_cc.pk),
     }
     response = get_graphql_content(api_client.post_graphql(query, variables))
     assert not response["data"]["checkoutDeliveryMethodUpdate"]["errors"]
@@ -552,10 +495,10 @@ def test_add_billing_address_to_checkout(
         FRAGMENT_CHECKOUT
         + """
             mutation UpdateCheckoutBillingAddress(
-              $token: UUID, $billingAddress: AddressInput!
+              $id: ID, $billingAddress: AddressInput!
             ) {
               checkoutBillingAddressUpdate(
-                  token: $token, billingAddress: $billingAddress
+                  id: $id, billingAddress: $billingAddress
               ) {
                 errors {
                   field
@@ -569,7 +512,7 @@ def test_add_billing_address_to_checkout(
         """
     )
     variables = {
-        "token": checkout_with_shipping_method.token,
+        "id": to_global_id_or_none(checkout_with_shipping_method),
         "billingAddress": graphql_address_data,
     }
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -579,8 +522,8 @@ def test_add_billing_address_to_checkout(
 MUTATION_CHECKOUT_LINES_UPDATE = (
     FRAGMENT_CHECKOUT_LINE
     + """
-        mutation updateCheckoutLine($token: UUID, $lines: [CheckoutLineInput]!){
-          checkoutLinesUpdate(token: $token, lines: $lines) {
+        mutation updateCheckoutLine($id: ID, $lines: [CheckoutLineUpdateInput!]!){
+          checkoutLinesUpdate(id: $id, lines: $lines) {
             checkout {
               id
               lines {
@@ -616,7 +559,7 @@ def test_update_checkout_lines(
     count_queries,
 ):
     variables = {
-        "token": checkout_with_items.token,
+        "id": to_global_id_or_none(checkout_with_items),
         "lines": [
             {
                 "quantity": 1,
@@ -700,16 +643,25 @@ def test_update_checkout_lines_with_reservations(
     add_variants_to_checkout(
         checkout,
         variants,
-        [2] * 10,
-        channel_USD.slug,
+        [
+            CheckoutLineData(
+                variant_id=str(variant.pk),
+                quantity=2,
+                quantity_to_update=True,
+                custom_price=None,
+                custom_price_to_update=False,
+            )
+            for variant in variants
+        ],
+        channel_USD,
         replace_reservations=True,
         reservation_length=5,
     )
 
-    with django_assert_num_queries(53):
+    with django_assert_num_queries(70):
         variant_id = graphene.Node.to_global_id("ProductVariant", variants[0].pk)
         variables = {
-            "token": checkout.token,
+            "id": to_global_id_or_none(checkout),
             "lines": [{"quantity": 3, "variantId": variant_id}],
         }
         response = user_api_client.post_graphql(
@@ -720,9 +672,9 @@ def test_update_checkout_lines_with_reservations(
         assert not data["errors"]
 
     # Updating multiple lines in checkout has same query count as updating one
-    with django_assert_num_queries(53):
+    with django_assert_num_queries(70):
         variables = {
-            "token": checkout.token,
+            "id": to_global_id_or_none(checkout),
             "lines": [],
         }
 
@@ -741,8 +693,8 @@ def test_update_checkout_lines_with_reservations(
 MUTATION_CHECKOUT_LINES_ADD = (
     FRAGMENT_CHECKOUT_LINE
     + """
-        mutation addCheckoutLines($checkoutId: ID!, $lines: [CheckoutLineInput]!){
-          checkoutLinesAdd(checkoutId: $checkoutId, lines: $lines) {
+        mutation addCheckoutLines($id: ID, $lines: [CheckoutLineInput!]!){
+          checkoutLinesAdd(id: $id, lines: $lines) {
             checkout {
               id
               lines {
@@ -787,7 +739,7 @@ def test_add_checkout_lines(
     mock_send_request.return_value = mock_json_response
 
     variables = {
-        "checkoutId": Node.to_global_id("Checkout", checkout_with_single_item.pk),
+        "id": Node.to_global_id("Checkout", checkout_with_single_item.pk),
         "lines": [
             {
                 "quantity": 1,
@@ -868,9 +820,10 @@ def test_add_checkout_lines_with_external_shipping(
     checkout_with_single_item.shipping_address = address
     set_external_shipping_id(checkout_with_single_item, external_shipping_method_id)
     checkout_with_single_item.save()
+    checkout_with_single_item.metadata_storage.save()
 
     variables = {
-        "checkoutId": Node.to_global_id("Checkout", checkout_with_single_item.pk),
+        "id": Node.to_global_id("Checkout", checkout_with_single_item.pk),
         "lines": [
             {
                 "quantity": 1,
@@ -912,9 +865,11 @@ def test_add_checkout_lines_with_external_shipping(
         api_client.post_graphql(MUTATION_CHECKOUT_LINES_ADD, variables)
     )
     assert not response["data"]["checkoutLinesAdd"]["errors"]
-    # One api call:
+    # Three api calls:
     # - post-mutate() logic used to validate currently selected method
-    assert mock_send_request.call_count == 1
+    # - fetch_checkout_prices_if_expired - calculating all prices for checkout
+    # - in check_stock_quantity_bulk to check if the shipping method is set
+    assert mock_send_request.call_count == 3
 
 
 @pytest.mark.django_db
@@ -961,9 +916,9 @@ def test_add_checkout_lines_with_reservations(
         new_lines.append({"quantity": 2, "variantId": variant_id})
 
     # Adding multiple lines to checkout has same query count as adding one
-    with django_assert_num_queries(53):
+    with django_assert_num_queries(69):
         variables = {
-            "checkoutId": Node.to_global_id("Checkout", checkout.pk),
+            "id": Node.to_global_id("Checkout", checkout.pk),
             "lines": [new_lines[0]],
             "channelSlug": checkout.channel.slug,
         }
@@ -974,9 +929,9 @@ def test_add_checkout_lines_with_reservations(
 
     checkout.lines.exclude(id=line.id).delete()
 
-    with django_assert_num_queries(53):
+    with django_assert_num_queries(69):
         variables = {
-            "checkoutId": Node.to_global_id("Checkout", checkout.pk),
+            "id": Node.to_global_id("Checkout", checkout.pk),
             "lines": new_lines,
             "channelSlug": checkout.channel.slug,
         }
@@ -995,10 +950,10 @@ def test_checkout_shipping_address_update(
         FRAGMENT_CHECKOUT
         + """
             mutation UpdateCheckoutShippingAddress(
-              $token: UUID, $shippingAddress: AddressInput!
+              $id: ID, $shippingAddress: AddressInput!
             ) {
               checkoutShippingAddressUpdate(
-                token: $token, shippingAddress: $shippingAddress
+                id: $id, shippingAddress: $shippingAddress
               ) {
                 errors {
                   field
@@ -1012,7 +967,7 @@ def test_checkout_shipping_address_update(
         """
     )
     variables = {
-        "token": checkout_with_variants.pk,
+        "id": to_global_id_or_none(checkout_with_variants),
         "shippingAddress": graphql_address_data,
     }
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1026,9 +981,9 @@ def test_checkout_email_update(api_client, checkout_with_variants, count_queries
         FRAGMENT_CHECKOUT
         + """
             mutation UpdateCheckoutEmail(
-              $token: UUID, $email: String!
+              $id: ID, $email: String!
             ) {
-              checkoutEmailUpdate(token: $token, email: $email) {
+              checkoutEmailUpdate(id: $id, email: $email) {
                 checkout {
                   ...Checkout
                 }
@@ -1041,7 +996,7 @@ def test_checkout_email_update(api_client, checkout_with_variants, count_queries
         """
     )
     variables = {
-        "token": checkout_with_variants.token,
+        "id": to_global_id_or_none(checkout_with_variants),
         "email": "newEmail@example.com",
     }
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1056,8 +1011,8 @@ def test_checkout_voucher_code(
     query = (
         FRAGMENT_CHECKOUT
         + """
-            mutation AddCheckoutPromoCode($token: UUID, $promoCode: String!) {
-              checkoutAddPromoCode(token: $token, promoCode: $promoCode) {
+            mutation AddCheckoutPromoCode($id: ID, $promoCode: String!) {
+              checkoutAddPromoCode(id: $id, promoCode: $promoCode) {
                 checkout {
                   ...Checkout
                 }
@@ -1075,7 +1030,7 @@ def test_checkout_voucher_code(
         """
     )
     variables = {
-        "token": checkout_with_billing_address.token,
+        "id": to_global_id_or_none(checkout_with_billing_address),
         "promoCode": voucher.code,
     }
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1088,8 +1043,8 @@ def test_checkout_payment_charge(
     api_client, checkout_with_billing_address, count_queries
 ):
     query = """
-        mutation createPayment($input: PaymentInput!, $token: UUID) {
-          checkoutPaymentCreate(input: $input, token: $token) {
+        mutation createPayment($input: PaymentInput!, $id: ID) {
+          checkoutPaymentCreate(input: $input, id: $id) {
             errors {
               field
               message
@@ -1099,7 +1054,7 @@ def test_checkout_payment_charge(
     """
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout_with_billing_address)
+    lines, _ = fetch_checkout_lines(checkout_with_billing_address)
     checkout_info = fetch_checkout_info(
         checkout_with_billing_address, lines, [], manager
     )
@@ -1112,7 +1067,7 @@ def test_checkout_payment_charge(
     )
 
     variables = {
-        "token": checkout_with_billing_address.token,
+        "id": to_global_id_or_none(checkout_with_billing_address),
         "input": {
             "amount": total.gross.amount,
             "gateway": "mirumee.payments.dummy",
@@ -1260,8 +1215,8 @@ FRAGMENT_ORDER_DETAIL_FOR_CC = (
 )
 
 COMPLETE_CHECKOUT_MUTATION_PART = """
-    mutation completeCheckout($token: UUID) {
-      checkoutComplete(token: $token) {
+    mutation completeCheckout($id: ID) {
+      checkoutComplete(id: $id) {
         errors {
           code
           field
@@ -1291,7 +1246,7 @@ def test_complete_checkout(api_client, checkout_with_charged_payment, count_quer
     query = COMPLETE_CHECKOUT_MUTATION
 
     variables = {
-        "token": checkout_with_charged_payment.token,
+        "id": to_global_id_or_none(checkout_with_charged_payment),
     }
 
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1310,7 +1265,7 @@ def test_complete_checkout_with_out_of_stock_webhook(
     query = COMPLETE_CHECKOUT_MUTATION
     Stock.objects.update(quantity=10)
     variables = {
-        "token": checkout_with_charged_payment.token,
+        "id": to_global_id_or_none(checkout_with_charged_payment),
     }
 
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1331,7 +1286,7 @@ def test_complete_checkout_with_single_line(
     )
 
     variables = {
-        "token": checkout_with_charged_payment.token,
+        "id": to_global_id_or_none(checkout_with_charged_payment),
     }
 
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1346,7 +1301,7 @@ def test_complete_checkout_with_digital_line(
     query = COMPLETE_CHECKOUT_MUTATION
 
     variables = {
-        "token": checkout_with_digital_line_with_charged_payment.token,
+        "id": to_global_id_or_none(checkout_with_digital_line_with_charged_payment),
     }
 
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1363,7 +1318,7 @@ def test_customer_complete_checkout(
     checkout.user = customer_user
     checkout.save()
     variables = {
-        "token": checkout.token,
+        "id": to_global_id_or_none(checkout),
     }
 
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1380,7 +1335,7 @@ def test_customer_complete_checkout_for_cc(
     checkout.user = customer_user
     checkout.save()
     variables = {
-        "token": checkout.token,
+        "id": to_global_id_or_none(checkout),
     }
 
     response = get_graphql_content(api_client.post_graphql(query, variables))
@@ -1395,7 +1350,7 @@ def test_complete_checkout_preorder(
     query = COMPLETE_CHECKOUT_MUTATION
 
     variables = {
-        "token": checkout_preorder_with_charged_payment.token,
+        "id": to_global_id_or_none(checkout_preorder_with_charged_payment),
     }
 
     response = get_graphql_content(api_client.post_graphql(query, variables))

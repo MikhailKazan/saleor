@@ -1,7 +1,7 @@
 import json
 import logging
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict, List, Optional, cast
+from typing import Dict, List, Optional, cast, overload
 
 import graphene
 from babel.numbers import get_currency_precision
@@ -9,10 +9,14 @@ from django.core.serializers.json import DjangoJSONEncoder
 from django.db.models import Q
 
 from ..account.models import User
+from ..checkout.fetch import fetch_checkout_info, fetch_checkout_lines
 from ..checkout.models import Checkout
 from ..core.prices import quantize_price
 from ..core.tracing import traced_atomic_transaction
+from ..discount.utils import fetch_active_discounts
 from ..order.models import Order
+from ..order.utils import update_order_authorize_data, update_order_charge_data
+from ..plugins.manager import PluginsManager, get_plugins_manager
 from . import (
     ChargeStatus,
     GatewayError,
@@ -25,13 +29,14 @@ from .interface import (
     AddressData,
     GatewayResponse,
     PaymentData,
+    PaymentLineData,
+    PaymentLinesData,
     PaymentMethodInfo,
+    RefundData,
     StorePaymentMethodEnum,
+    TransactionData,
 )
 from .models import Payment, Transaction
-
-if TYPE_CHECKING:
-    from ..plugins.manager import PluginsManager
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +44,126 @@ GENERIC_TRANSACTION_ERROR = "Transaction was unsuccessful"
 ALLOWED_GATEWAY_KINDS = {choices[0] for choices in TransactionKind.CHOICES}
 
 
+def create_payment_lines_information(
+    payment: Payment,
+    manager: PluginsManager,
+) -> PaymentLinesData:
+    checkout = payment.checkout
+    order = payment.order
+
+    if checkout:
+        return create_checkout_payment_lines_information(checkout, manager)
+    elif order:
+        return create_order_payment_lines_information(order)
+
+    return PaymentLinesData(
+        shipping_amount=Decimal("0.00"),
+        voucher_amount=Decimal("0.00"),
+        lines=[],
+    )
+
+
+def create_checkout_payment_lines_information(
+    checkout: Checkout, manager: PluginsManager
+) -> PaymentLinesData:
+    line_items = []
+    lines, _ = fetch_checkout_lines(checkout)
+    discounts = fetch_active_discounts()
+    checkout_info = fetch_checkout_info(checkout, lines, discounts, manager)
+    address = checkout_info.shipping_address or checkout_info.billing_address
+
+    for line_info in lines:
+        unit_price = manager.calculate_checkout_line_unit_price(
+            checkout_info,
+            lines,
+            line_info,
+            address,
+            discounts,
+        )
+        unit_gross = unit_price.gross.amount
+
+        quantity = line_info.line.quantity
+        product_name = f"{line_info.variant.product.name}, {line_info.variant.name}"
+        product_sku = line_info.variant.sku
+        line_items.append(
+            PaymentLineData(
+                quantity=quantity,
+                product_name=product_name,
+                product_sku=product_sku,
+                variant_id=line_info.variant.id,
+                amount=unit_gross,
+            )
+        )
+    shipping_amount = manager.calculate_checkout_shipping(
+        checkout_info=checkout_info,
+        lines=lines,
+        address=address,
+        discounts=discounts,
+    ).gross.amount
+
+    voucher_amount = -checkout.discount_amount
+
+    return PaymentLinesData(
+        shipping_amount=shipping_amount,
+        voucher_amount=voucher_amount,
+        lines=line_items,
+    )
+
+
+def create_order_payment_lines_information(order: Order) -> PaymentLinesData:
+    line_items = []
+    for order_line in order.lines.all():
+        product_name = f"{order_line.product_name}, {order_line.variant_name}"
+
+        variant_id = order_line.variant_id
+        if variant_id is None:
+            continue
+
+        line_items.append(
+            PaymentLineData(
+                quantity=order_line.quantity,
+                product_name=product_name,
+                product_sku=order_line.product_sku,
+                variant_id=variant_id,
+                amount=order_line.unit_price_gross_amount,
+            )
+        )
+
+    shipping_amount = order.shipping_price_gross_amount
+    voucher_amount = order.total_gross_amount - order.undiscounted_total_gross_amount
+
+    return PaymentLinesData(
+        shipping_amount=shipping_amount,
+        voucher_amount=voucher_amount,
+        lines=line_items,
+    )
+
+
+def generate_transactions_data(payment: Payment) -> List[TransactionData]:
+    return [
+        TransactionData(
+            token=t.token,
+            is_success=t.is_success,
+            kind=t.kind,
+            gateway_response=t.gateway_response,
+            amount={
+                "amount": str(quantize_price(t.amount, t.currency)),
+                "currency": t.currency,
+            },
+        )
+        for t in payment.transactions.all()
+    ]
+
+
 def create_payment_information(
     payment: Payment,
-    payment_token: str = None,
-    amount: Decimal = None,
-    customer_id: str = None,
+    payment_token: Optional[str] = None,
+    amount: Optional[Decimal] = None,
+    customer_id: Optional[str] = None,
     store_source: bool = False,
+    refund_data: Optional[RefundData] = None,
     additional_data: Optional[dict] = None,
+    manager: Optional[PluginsManager] = None,
 ) -> PaymentData:
     """Extract order information along with payment details.
 
@@ -58,7 +176,9 @@ def create_payment_information(
         email = cast(str, checkout.get_customer_email())
         user_id = checkout.user_id
         checkout_token = str(checkout.token)
-        checkout_metadata = checkout.metadata
+        from ..checkout.utils import get_or_create_checkout_metadata
+
+        checkout_metadata = get_or_create_checkout_metadata(checkout).metadata
     elif order := payment.order:
         billing = order.billing_address
         shipping = order.shipping_address
@@ -77,7 +197,9 @@ def create_payment_information(
     billing_address = AddressData(**billing.as_data()) if billing else None
     shipping_address = AddressData(**shipping.as_data()) if shipping else None
 
-    order_id = payment.order.pk if payment.order else None
+    order = payment.order
+    order_id = order.pk if order else None
+    channel_slug = order.channel.slug if order and order.channel else None
     graphql_payment_id = graphene.Node.to_global_id("Payment", payment.pk)
 
     graphql_customer_id = None
@@ -91,7 +213,8 @@ def create_payment_information(
         currency=payment.currency,
         billing=billing_address,
         shipping=shipping_address,
-        order_id=order_id,
+        order_id=str(order_id),
+        order_channel_slug=channel_slug,
         payment_id=payment.pk,
         graphql_payment_id=graphql_payment_id,
         customer_ip_address=payment.customer_ip_address,
@@ -107,6 +230,11 @@ def create_payment_information(
         checkout_metadata=checkout_metadata,
         payment_metadata=payment.metadata,
         psp_reference=payment.psp_reference,
+        refund_data=refund_data,
+        transactions=generate_transactions_data(payment),
+        _resolve_lines_data=lambda: create_payment_lines_information(
+            payment, manager or get_plugins_manager()
+        ),
     )
 
 
@@ -115,12 +243,12 @@ def create_payment(
     total: Decimal,
     currency: str,
     email: str,
-    customer_ip_address: str = "",
-    payment_token: Optional[str] = "",
-    extra_data: Dict = None,
-    checkout: Checkout = None,
-    order: Order = None,
-    return_url: str = None,
+    customer_ip_address: Optional[str] = None,
+    payment_token: Optional[str] = None,
+    extra_data: Optional[Dict] = None,
+    checkout: Optional[Checkout] = None,
+    order: Optional[Order] = None,
+    return_url: Optional[str] = None,
     external_reference: Optional[str] = None,
     store_payment_method: str = StorePaymentMethod.NONE,
     metadata: Optional[Dict[str, str]] = None,
@@ -136,9 +264,9 @@ def create_payment(
 
     data = {
         "is_active": True,
-        "customer_ip_address": customer_ip_address,
+        "customer_ip_address": customer_ip_address or "",
         "extra_data": json.dumps(extra_data),
-        "token": payment_token,
+        "token": payment_token or "",
     }
 
     if checkout:
@@ -171,6 +299,7 @@ def create_payment(
         "gateway": gateway,
         "total": total,
         "return_url": return_url,
+        "partial": False,
         "psp_reference": external_reference or "",
         "store_payment_method": store_payment_method,
         "metadata": {} if metadata is None else metadata,
@@ -194,12 +323,41 @@ def get_already_processed_transaction(
     return transaction
 
 
+@overload
 def create_transaction(
     payment: Payment,
+    *,
     kind: str,
     payment_information: PaymentData,
     action_required: bool = False,
-    gateway_response: GatewayResponse = None,
+    gateway_response: Optional[GatewayResponse] = None,
+    error_msg=None,
+    is_success=False,
+) -> Transaction:
+    ...
+
+
+@overload
+def create_transaction(
+    payment: Payment,
+    *,
+    kind: str,
+    payment_information: Optional[PaymentData],
+    action_required: bool = False,
+    gateway_response: GatewayResponse,
+    error_msg=None,
+    is_success=False,
+) -> Transaction:
+    ...
+
+
+def create_transaction(
+    payment: Payment,
+    *,
+    kind: str,
+    payment_information: Optional[PaymentData],
+    action_required: bool = False,
+    gateway_response: Optional[GatewayResponse] = None,
     error_msg=None,
     is_success=False,
 ) -> Transaction:
@@ -207,6 +365,8 @@ def create_transaction(
     # Default values for token, amount, currency are only used in cases where
     # response from gateway was invalid or an exception occurred
     if not gateway_response:
+        if not payment_information:
+            raise ValueError("Payment information is required to create a transaction.")
         gateway_response = GatewayResponse(
             kind=kind,
             action_required=False,
@@ -239,7 +399,7 @@ def get_already_processed_transaction_or_create_new_transaction(
     kind: str,
     payment_information: PaymentData,
     action_required: bool = False,
-    gateway_response: GatewayResponse = None,
+    gateway_response: Optional[GatewayResponse] = None,
     error_msg=None,
 ) -> Transaction:
     if gateway_response and gateway_response.transaction_already_processed:
@@ -248,11 +408,11 @@ def get_already_processed_transaction_or_create_new_transaction(
             return txn
     return create_transaction(
         payment,
-        kind,
-        payment_information,
-        action_required,
-        gateway_response,
-        error_msg,
+        kind=kind,
+        payment_information=payment_information,
+        action_required=action_required,
+        gateway_response=gateway_response,
+        error_msg=error_msg,
     )
 
 
@@ -291,11 +451,13 @@ def validate_gateway_response(response: GatewayResponse):
 
 
 @traced_atomic_transaction()
-def gateway_postprocess(transaction, payment):
-    changed_fields = []
+def gateway_postprocess(transaction, payment: Payment):
+    changed_fields: List[str] = []
 
     if not transaction.is_success or transaction.already_processed:
         if changed_fields:
+            # FIXME: verify that we actually want to save the payment here
+            # as with empty changed_fields it won't be saved
             payment.save(update_fields=changed_fields)
         return
 
@@ -318,7 +480,6 @@ def update_payment_charge_status(payment, transaction, changed_fields=None):
     changed_fields = changed_fields or []
 
     transaction_kind = transaction.kind
-
     if transaction_kind in {
         TransactionKind.CAPTURE,
         TransactionKind.REFUND_REVERSED,
@@ -330,14 +491,14 @@ def update_payment_charge_status(payment, transaction, changed_fields=None):
         payment.charge_status = ChargeStatus.PARTIALLY_CHARGED
         if payment.get_charge_amount() <= 0:
             payment.charge_status = ChargeStatus.FULLY_CHARGED
-        changed_fields += ["charge_status", "captured_amount", "modified"]
+        changed_fields += ["charge_status", "captured_amount", "modified_at"]
 
     elif transaction_kind == TransactionKind.VOID:
         payment.is_active = False
-        changed_fields += ["is_active", "modified"]
+        changed_fields += ["is_active", "modified_at"]
 
     elif transaction_kind == TransactionKind.REFUND:
-        changed_fields += ["captured_amount", "modified"]
+        changed_fields += ["captured_amount", "modified_at"]
         payment.captured_amount -= transaction.amount
         payment.charge_status = ChargeStatus.PARTIALLY_REFUNDED
         if payment.captured_amount <= 0:
@@ -361,13 +522,15 @@ def update_payment_charge_status(payment, transaction, changed_fields=None):
             payment.charge_status = ChargeStatus.PARTIALLY_CHARGED
             if payment.captured_amount <= 0:
                 payment.charge_status = ChargeStatus.NOT_CHARGED
-            changed_fields += ["charge_status", "captured_amount", "modified"]
+            changed_fields += ["charge_status", "captured_amount", "modified_at"]
     if changed_fields:
         payment.save(update_fields=changed_fields)
     transaction.already_processed = True
     transaction.save(update_fields=["already_processed"])
-    if "captured_amount" in changed_fields and payment.order:
-        payment.order.update_total_paid()
+    if "captured_amount" in changed_fields and payment.order_id:
+        update_order_charge_data(payment.order)
+    if transaction_kind == TransactionKind.AUTH and payment.order_id:
+        update_order_authorize_data(payment.order)
 
 
 def fetch_customer_id(user: User, gateway: str):
@@ -380,7 +543,7 @@ def store_customer_id(user: User, gateway: str, customer_id: str):
     """Store customer_id in users private meta for desired gateway."""
     meta_key = prepare_key_for_gateway_customer_id(gateway)
     user.store_value_in_private_metadata(items={meta_key: customer_id})
-    user.save(update_fields=["private_metadata"])
+    user.save(update_fields=["private_metadata", "updated_at"])
 
 
 def prepare_key_for_gateway_customer_id(gateway_name: str) -> str:
@@ -467,8 +630,46 @@ def price_to_minor_unit(value: Decimal, currency: str):
     return str(value_without_comma.quantize(Decimal("1")))
 
 
+def get_channel_slug_from_payment(payment: Payment) -> Optional[str]:
+    channel_slug = None
+
+    if payment.checkout:
+        channel_slug = payment.checkout.channel.slug
+    elif payment.order:
+        channel_slug = payment.order.channel.slug
+
+    return channel_slug
+
+
+def try_void_or_refund_inactive_payment(
+    payment: Payment, transaction: Transaction, manager: "PluginsManager"
+):
+    """Handle refund or void inactive payments.
+
+    In case when we have open multiple payments for single checkout but only one is
+    active. Some payment methods don't required confirmation so we can receive delayed
+    webhook when we have order already paid.
+    """
+    from .gateway import payment_refund_or_void
+
+    if not transaction.is_success:
+        return
+
+    if not transaction.already_processed:
+        update_payment_charge_status(payment, transaction)
+    channel_slug = get_channel_slug_from_payment(payment)
+    try:
+        payment_refund_or_void(payment, manager, channel_slug=channel_slug)
+    except PaymentError:
+        logger.exception(
+            "Unable to void/refund an inactive payment %s, %s.",
+            payment.id,
+            payment.psp_reference,
+        )
+
+
 def payment_owned_by_user(payment_pk: int, user) -> bool:
-    if user.is_anonymous:
+    if not user:
         return False
     return (
         Payment.objects.filter(

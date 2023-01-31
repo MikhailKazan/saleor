@@ -1,24 +1,35 @@
+from decimal import Decimal
 from unittest import mock
 
 import pytest
-from django.contrib.auth.models import AnonymousUser
+from django.core.exceptions import ValidationError
 from django.test import override_settings
+from prices import TaxedMoney
 
 from ...account import CustomerEvents
 from ...account.models import CustomerEvent
 from ...core.exceptions import InsufficientStock
 from ...core.notify_events import NotifyEventType
 from ...core.taxes import zero_money, zero_taxed_money
+from ...core.tests.utils import get_site_context_payload
+from ...discount.models import VoucherCustomer
 from ...giftcard import GiftCardEvents
 from ...giftcard.models import GiftCard, GiftCardEvent
 from ...order import OrderEvents
 from ...order.models import OrderEvent
 from ...order.notifications import get_default_order_payload
+from ...payment import TransactionKind
+from ...payment.models import Payment
 from ...plugins.manager import get_plugins_manager
 from ...product.models import ProductTranslation, ProductVariantTranslation
 from ...tests.utils import flush_post_commit_hooks
 from .. import calculations
-from ..complete_checkout import _create_order, _prepare_order_data, complete_checkout
+from ..complete_checkout import (
+    _create_order,
+    _prepare_order_data,
+    _process_shipping_data_for_order,
+    complete_checkout,
+)
 from ..fetch import fetch_checkout_info, fetch_checkout_lines
 from ..utils import add_variant_to_checkout
 
@@ -31,6 +42,7 @@ def test_create_order_captured_payment_creates_expected_events(
     shipping_method,
     payment_txn_captured,
     channel_USD,
+    site_settings,
 ):
     checkout = checkout_with_item
     checkout_user = customer_user
@@ -51,7 +63,7 @@ def test_create_order_captured_payment_creates_expected_events(
 
     # Place checkout
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     order = _create_order(
         checkout_info=checkout_info,
@@ -61,7 +73,7 @@ def test_create_order_captured_payment_creates_expected_events(
             checkout_info=checkout_info,
             lines=lines,
             discounts=[],
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
         user=customer_user,
         app=None,
@@ -117,23 +129,21 @@ def test_create_order_captured_payment_creates_expected_events(
     expected_order_payload = {
         "order": get_default_order_payload(order, checkout.redirect_url),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
     expected_payment_payload = {
         "order": get_default_order_payload(order),
         "recipient_email": order.get_customer_email(),
         "payment": {
-            "created": payment_txn_captured.created,
-            "modified": payment_txn_captured.modified,
+            "created": payment_txn_captured.created_at,
+            "modified": payment_txn_captured.modified_at,
             "charge_status": payment_txn_captured.charge_status,
             "total": payment_txn_captured.total,
             "captured_amount": payment_txn_captured.captured_amount,
             "currency": payment_txn_captured.currency,
         },
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
     # Ensure the correct order confirmed event was created
     # should be order confirmed event
@@ -180,6 +190,7 @@ def test_create_order_captured_payment_creates_expected_events_anonymous_user(
     shipping_method,
     payment_txn_captured,
     channel_USD,
+    site_settings,
 ):
     checkout = checkout_with_item
     checkout_user = None
@@ -201,7 +212,7 @@ def test_create_order_captured_payment_creates_expected_events_anonymous_user(
 
     # Place checkout
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     order = _create_order(
         checkout_info=checkout_info,
@@ -211,9 +222,9 @@ def test_create_order_captured_payment_creates_expected_events_anonymous_user(
             checkout_info=checkout_info,
             lines=lines,
             discounts=None,
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
-        user=AnonymousUser(),
+        user=None,
         app=None,
         manager=manager,
     )
@@ -267,23 +278,21 @@ def test_create_order_captured_payment_creates_expected_events_anonymous_user(
     expected_order_payload = {
         "order": get_default_order_payload(order, checkout.redirect_url),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
     expected_payment_payload = {
         "order": get_default_order_payload(order),
         "recipient_email": order.get_customer_email(),
         "payment": {
-            "created": payment_txn_captured.created,
-            "modified": payment_txn_captured.modified,
+            "created": payment_txn_captured.created_at,
+            "modified": payment_txn_captured.modified_at,
             "charge_status": payment_txn_captured.charge_status,
             "total": payment_txn_captured.total,
             "captured_amount": payment_txn_captured.captured_amount,
             "currency": payment_txn_captured.currency,
         },
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
     # Ensure the correct order confirmed event was created
@@ -326,6 +335,7 @@ def test_create_order_preauth_payment_creates_expected_events(
     shipping_method,
     payment_txn_preauth,
     channel_USD,
+    site_settings,
 ):
     checkout = checkout_with_item
     checkout_user = customer_user
@@ -346,7 +356,7 @@ def test_create_order_preauth_payment_creates_expected_events(
 
     # Place checkout
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     order = _create_order(
         checkout_info=checkout_info,
@@ -356,7 +366,7 @@ def test_create_order_preauth_payment_creates_expected_events(
             checkout_info=checkout_info,
             lines=lines,
             discounts=[],
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
         user=customer_user,
         app=None,
@@ -399,8 +409,7 @@ def test_create_order_preauth_payment_creates_expected_events(
     expected_payload = {
         "order": get_default_order_payload(order, checkout.redirect_url),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
     # Ensure the correct order confirmed event was created
@@ -438,6 +447,7 @@ def test_create_order_preauth_payment_creates_expected_events_anonymous_user(
     shipping_method,
     payment_txn_preauth,
     channel_USD,
+    site_settings,
 ):
     checkout = checkout_with_item
     checkout_user = None
@@ -459,7 +469,7 @@ def test_create_order_preauth_payment_creates_expected_events_anonymous_user(
 
     # Place checkout
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     order = _create_order(
         checkout_info=checkout_info,
@@ -469,9 +479,9 @@ def test_create_order_preauth_payment_creates_expected_events_anonymous_user(
             checkout_info=checkout_info,
             lines=lines,
             discounts=[],
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
-        user=AnonymousUser(),
+        user=None,
         app=None,
         manager=manager,
     )
@@ -512,8 +522,7 @@ def test_create_order_preauth_payment_creates_expected_events_anonymous_user(
     expected_payload = {
         "order": get_default_order_payload(order, checkout.redirect_url),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
     # Ensure the correct order confirmed event was created
     # should be order confirmed event
@@ -551,14 +560,14 @@ def test_create_order_insufficient_stock(
     checkout.tracking_code = "tracking_code"
     checkout.save()
 
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     with pytest.raises(InsufficientStock):
         _prepare_order_data(
             manager=manager,
             checkout_info=checkout_info,
             lines=lines,
             discounts=[],
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         )
 
 
@@ -575,14 +584,14 @@ def test_create_order_doesnt_duplicate_order(
     checkout.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     order_data = _prepare_order_data(
         manager=manager,
         checkout_info=checkout_info,
         lines=lines,
         discounts=[],
-        taxes_included_in_prices=True,
+        prices_entered_with_tax=True,
     )
 
     order_1 = _create_order(
@@ -593,7 +602,7 @@ def test_create_order_doesnt_duplicate_order(
         app=None,
         manager=manager,
     )
-    assert order_1.checkout_token == checkout.token
+    assert order_1.checkout_token == str(checkout.token)
 
     order_2 = _create_order(
         checkout_info=checkout_info,
@@ -621,7 +630,7 @@ def test_create_order_with_gift_card(
     checkout.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
 
     subtotal = calculations.checkout_subtotal(
@@ -649,9 +658,9 @@ def test_create_order_with_gift_card(
             checkout_info=checkout_info,
             lines=lines,
             discounts=None,
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
-        user=customer_user if not is_anonymous_user else AnonymousUser(),
+        user=customer_user if not is_anonymous_user else None,
         app=None,
         manager=manager,
     )
@@ -678,7 +687,7 @@ def test_create_order_with_gift_card_partial_use(
     checkout.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
 
     price_without_gift_card = calculations.checkout_total(
@@ -700,7 +709,7 @@ def test_create_order_with_gift_card_partial_use(
             checkout_info=checkout_info,
             lines=lines,
             discounts=[],
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
         user=customer_user,
         app=None,
@@ -738,7 +747,7 @@ def test_create_order_with_many_gift_cards(
     checkout.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
 
     price_without_gift_card = calculations.checkout_total(
@@ -764,7 +773,7 @@ def test_create_order_with_many_gift_cards(
             checkout_info=checkout_info,
             lines=lines,
             discounts=[],
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
         user=customer_user,
         app=None,
@@ -793,11 +802,15 @@ def test_create_order_with_many_gift_cards(
 def test_create_order_gift_card_bought(
     send_notification_mock,
     checkout_with_gift_card_items,
+    payment_txn_captured,
     customer_user,
     shipping_method,
     is_anonymous_user,
     non_shippable_gift_card_product,
 ):
+    """Ensure that the gift cards will be fulfilled, when newly created order
+    is captured."""
+    # given
     checkout_user = None if is_anonymous_user else customer_user
     checkout = checkout_with_gift_card_items
     checkout.user = checkout_user
@@ -809,7 +822,104 @@ def test_create_order_gift_card_bought(
     checkout.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+
+    amount = calculations.calculate_checkout_total_with_gift_cards(
+        manager, checkout_info, lines, customer_user.default_billing_address
+    ).gross.amount
+
+    payment_txn_captured.order = None
+    payment_txn_captured.checkout = checkout
+    payment_txn_captured.captured_amount = amount
+    payment_txn_captured.total = amount
+    payment_txn_captured.save(
+        update_fields=["order", "checkout", "total", "captured_amount"]
+    )
+
+    txn = payment_txn_captured.transactions.first()
+    txn.amount = amount
+    txn.save(update_fields=["amount"])
+
+    subtotal = calculations.checkout_subtotal(
+        manager=manager,
+        checkout_info=checkout_info,
+        lines=lines,
+        address=checkout.shipping_address,
+    )
+    shipping_price = calculations.checkout_shipping_price(
+        manager=manager,
+        checkout_info=checkout_info,
+        lines=lines,
+        address=checkout.shipping_address,
+    )
+    total_gross = subtotal.gross + shipping_price.gross - checkout.discount
+
+    # when
+    order = _create_order(
+        checkout_info=checkout_info,
+        checkout_lines=lines,
+        order_data=_prepare_order_data(
+            manager=manager,
+            checkout_info=checkout_info,
+            lines=lines,
+            discounts=None,
+            prices_entered_with_tax=True,
+        ),
+        user=customer_user if not is_anonymous_user else None,
+        app=None,
+        manager=manager,
+    )
+
+    # then
+    flush_post_commit_hooks()
+    assert order.total.gross == total_gross
+    flush_post_commit_hooks()
+    gift_card = GiftCard.objects.get()
+    assert (
+        gift_card.initial_balance
+        == order.lines.get(
+            variant=non_shippable_gift_card_product.variants.first()
+        ).unit_price_gross
+    )
+    assert GiftCardEvent.objects.filter(gift_card=gift_card, type=GiftCardEvents.BOUGHT)
+    flush_post_commit_hooks()
+    send_notification_mock.assert_called_once_with(
+        checkout_user,
+        None,
+        checkout_user,
+        order.user_email,
+        gift_card,
+        manager,
+        order.channel.slug,
+        resending=False,
+    )
+
+
+@mock.patch("saleor.giftcard.utils.send_gift_card_notification")
+@pytest.mark.parametrize("is_anonymous_user", (True, False))
+def test_create_order_gift_card_bought_order_not_captured_gift_cards_not_sent(
+    send_notification_mock,
+    checkout_with_gift_card_items,
+    customer_user,
+    shipping_method,
+    is_anonymous_user,
+):
+    """Ensure that the gift cards will be not fulfilled, when newly created order
+    is not captured."""
+    # given
+    checkout_user = None if is_anonymous_user else customer_user
+    checkout = checkout_with_gift_card_items
+    checkout.user = checkout_user
+    checkout.billing_address = customer_user.default_billing_address
+    checkout.shipping_address = customer_user.default_billing_address
+    checkout.shipping_method = shipping_method
+    checkout.tracking_code = "tracking_code"
+    checkout.redirect_url = "https://www.example.com"
+    checkout.save()
+
+    manager = get_plugins_manager()
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
 
     subtotal = calculations.checkout_subtotal(
@@ -826,6 +936,7 @@ def test_create_order_gift_card_bought(
     )
     total_gross = subtotal.gross + shipping_price.gross - checkout.discount
 
+    # when
     order = _create_order(
         checkout_info=checkout_info,
         checkout_lines=lines,
@@ -834,34 +945,19 @@ def test_create_order_gift_card_bought(
             checkout_info=checkout_info,
             lines=lines,
             discounts=None,
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
-        user=customer_user if not is_anonymous_user else AnonymousUser(),
+        user=customer_user if not is_anonymous_user else None,
         app=None,
         manager=manager,
     )
 
+    # then
+    flush_post_commit_hooks()
     flush_post_commit_hooks()
     assert order.total.gross == total_gross
-    flush_post_commit_hooks()
-    gift_card = GiftCard.objects.get()
-    assert (
-        gift_card.initial_balance
-        == order.lines.get(
-            variant=non_shippable_gift_card_product.variants.first()
-        ).unit_price_gross
-    )
-    assert GiftCardEvent.objects.filter(gift_card=gift_card, type=GiftCardEvents.BOUGHT)
-    send_notification_mock.assert_called_once_with(
-        checkout_user,
-        None,
-        checkout_user,
-        order.user_email,
-        gift_card,
-        manager,
-        order.channel.slug,
-        resending=False,
-    )
+    assert not GiftCard.objects.exists()
+    send_notification_mock.assert_not_called()
 
 
 @mock.patch("saleor.giftcard.utils.send_gift_card_notification")
@@ -888,7 +984,7 @@ def test_create_order_gift_card_bought_only_shippable_gift_card(
     checkout.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
 
     subtotal = calculations.checkout_subtotal(
@@ -913,9 +1009,9 @@ def test_create_order_gift_card_bought_only_shippable_gift_card(
             checkout_info=checkout_info,
             lines=lines,
             discounts=None,
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
-        user=customer_user if not is_anonymous_user else AnonymousUser(),
+        user=customer_user if not is_anonymous_user else None,
         app=None,
         manager=manager,
     )
@@ -948,7 +1044,7 @@ def test_create_order_gift_card_bought_do_not_fulfill_gift_cards_automatically(
     checkout.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
 
     subtotal = calculations.checkout_subtotal(
@@ -973,9 +1069,9 @@ def test_create_order_gift_card_bought_do_not_fulfill_gift_cards_automatically(
             checkout_info=checkout_info,
             lines=lines,
             discounts=None,
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
-        user=customer_user if not is_anonymous_user else AnonymousUser(),
+        user=customer_user if not is_anonymous_user else None,
         app=None,
         manager=manager,
     )
@@ -991,7 +1087,7 @@ def test_note_in_created_order(checkout_with_item, address, customer_user):
     checkout_with_item.redirect_url = "https://www.example.com"
     checkout_with_item.save()
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout_with_item)
+    lines, _ = fetch_checkout_lines(checkout_with_item)
     checkout_info = fetch_checkout_info(checkout_with_item, lines, [], manager)
     order = _create_order(
         checkout_info=checkout_info,
@@ -1001,7 +1097,7 @@ def test_note_in_created_order(checkout_with_item, address, customer_user):
             checkout_info=checkout_info,
             lines=lines,
             discounts=[],
-            taxes_included_in_prices=True,
+            prices_entered_with_tax=True,
         ),
         user=customer_user,
         app=None,
@@ -1024,13 +1120,13 @@ def test_create_order_with_variant_tracking_false(
     checkout_info = fetch_checkout_info(checkout, [], [], manager)
     add_variant_to_checkout(checkout_info, variant, 10, check_quantity=False)
 
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     order_data = _prepare_order_data(
         manager=manager,
         checkout_info=checkout_info,
         lines=lines,
         discounts=[],
-        taxes_included_in_prices=True,
+        prices_entered_with_tax=True,
     )
 
     order_1 = _create_order(
@@ -1041,7 +1137,7 @@ def test_create_order_with_variant_tracking_false(
         app=None,
         manager=manager,
     )
-    assert order_1.checkout_token == checkout.token
+    assert order_1.checkout_token == str(checkout.token)
 
 
 @override_settings(LANGUAGE_CODE="fr")
@@ -1062,7 +1158,7 @@ def test_create_order_use_translations(
     checkout.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
 
     variant = lines[0].variant
@@ -1084,7 +1180,7 @@ def test_create_order_use_translations(
         checkout_info=checkout_info,
         lines=lines,
         discounts=[],
-        taxes_included_in_prices=True,
+        prices_entered_with_tax=True,
     )
     order_line = order_data["lines"][0].line
 
@@ -1094,7 +1190,12 @@ def test_create_order_use_translations(
 
 @mock.patch("saleor.plugins.manager.PluginsManager.notify")
 def test_complete_checkout_0_total_captured_payment_creates_expected_events(
-    mock_notify, checkout_with_item_total_0, customer_user, channel_USD, app
+    mock_notify,
+    checkout_with_item_total_0,
+    customer_user,
+    channel_USD,
+    app,
+    site_settings,
 ):
     checkout = checkout_with_item_total_0
     checkout_user = customer_user
@@ -1111,7 +1212,7 @@ def test_complete_checkout_0_total_captured_payment_creates_expected_events(
 
     # Place checkout
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     order, action_required, action_data = complete_checkout(
         checkout_info=checkout_info,
@@ -1158,8 +1259,7 @@ def test_complete_checkout_0_total_captured_payment_creates_expected_events(
     expected_order_payload = {
         "order": get_default_order_payload(order, checkout.redirect_url),
         "recipient_email": order.get_customer_email(),
-        "site_name": "mirumee.com",
-        "domain": "mirumee.com",
+        **get_site_context_payload(site_settings.site),
     }
 
     # Ensure the correct order confirmed event was created
@@ -1192,3 +1292,382 @@ def test_complete_checkout_0_total_captured_payment_creates_expected_events(
     assert placement_event.order == order  # check the associated order is valid
     assert placement_event.date  # ensure a date was set
     assert not placement_event.parameters  # should not have any additional parameters
+
+
+@mock.patch("saleor.checkout.complete_checkout._create_order")
+@mock.patch("saleor.checkout.complete_checkout._process_payment")
+def test_complete_checkout_action_required_voucher_once_per_customer(
+    mocked_process_payment,
+    mocked_create_order,
+    voucher,
+    customer_user,
+    checkout,
+    app,
+    payment_txn_to_confirm,
+    action_required_gateway_response,
+):
+    # given
+    mocked_process_payment.return_value = action_required_gateway_response
+
+    payment = Payment.objects.create(
+        gateway="mirumee.payments.dummy", is_active=True, checkout=checkout
+    )
+    payment.to_confirm = True
+    payment.save()
+
+    checkout.user = customer_user
+    checkout.billing_address = customer_user.default_billing_address
+    checkout.shipping_address = customer_user.default_billing_address
+    checkout.tracking_code = ""
+    checkout.redirect_url = "https://www.example.com"
+    checkout.voucher_code = voucher.code
+    checkout.save()
+
+    voucher.apply_once_per_customer = True
+    voucher.save()
+
+    manager = get_plugins_manager()
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+
+    # when
+    order, action_required, _ = complete_checkout(
+        checkout_info=checkout_info,
+        manager=manager,
+        lines=lines,
+        payment_data={},
+        store_source=False,
+        discounts=None,
+        user=customer_user,
+        app=app,
+    )
+    # then
+    voucher_customer = VoucherCustomer.objects.filter(
+        voucher=voucher, customer_email=customer_user.email
+    )
+    assert not order
+    assert action_required is True
+    assert not voucher_customer.exists()
+    mocked_create_order.assert_not_called()
+
+
+@mock.patch("saleor.checkout.complete_checkout._create_order")
+def test_complete_checkout_order_not_created_when_the_refund_is_ongoing(
+    mocked_create_order,
+    customer_user,
+    checkout,
+    payment_txn_to_confirm,
+):
+    # given
+    payment = Payment.objects.create(
+        gateway="mirumee.payments.dummy", is_active=True, checkout=checkout
+    )
+    payment.to_confirm = False
+    payment.save()
+    payment.transactions.create(
+        is_success=True,
+        action_required=False,
+        kind=TransactionKind.REFUND_ONGOING,
+        amount=payment.total,
+        currency=payment.currency,
+        token="test",
+        gateway_response={},
+    )
+
+    checkout.user = customer_user
+    checkout.billing_address = customer_user.default_billing_address
+    checkout.shipping_address = customer_user.default_billing_address
+    checkout.tracking_code = ""
+    checkout.redirect_url = "https://www.example.com"
+    checkout.save()
+
+    manager = get_plugins_manager()
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+
+    # when
+    order, _, _ = complete_checkout(
+        checkout_info=checkout_info,
+        manager=manager,
+        lines=lines,
+        payment_data={},
+        store_source=False,
+        discounts=None,
+        user=customer_user,
+        app=None,
+    )
+
+    # then
+    assert not order
+    mocked_create_order.assert_not_called()
+
+
+def test_process_shipping_data_for_order_store_customer_shipping_address(
+    checkout_with_item, customer_user, address_usa, shipping_method
+):
+    # given
+    checkout = checkout_with_item
+
+    checkout.user = customer_user
+    checkout.billing_address = customer_user.default_billing_address
+    checkout.shipping_address = address_usa
+    checkout.shipping_method = shipping_method
+    checkout.save()
+
+    user_address_count = customer_user.addresses.count()
+
+    manager = get_plugins_manager()
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+    shipping_price = zero_taxed_money(checkout.currency)
+    base_shipping_price = zero_money(checkout.currency)
+
+    # when
+    _ = _process_shipping_data_for_order(
+        checkout_info, base_shipping_price, shipping_price, manager, lines
+    )
+
+    # then
+    new_user_address_count = customer_user.addresses.count()
+    new_address_data = address_usa.as_data()
+    assert new_user_address_count == user_address_count + 1
+    assert customer_user.addresses.filter(**new_address_data).exists()
+
+
+def test_process_shipping_data_for_order_dont_store_customer_click_and_collect_address(
+    checkout_with_item_for_cc, customer_user, address_usa, warehouse_for_cc
+):
+    # given
+    checkout = checkout_with_item_for_cc
+
+    warehouse_for_cc.address = address_usa
+    warehouse_for_cc.save()
+
+    checkout.user = customer_user
+    checkout.billing_address = customer_user.default_billing_address
+    checkout.shipping_address = None
+    checkout.collection_point = warehouse_for_cc
+    checkout.save()
+
+    user_address_count = customer_user.addresses.count()
+
+    manager = get_plugins_manager()
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+    shipping_price = zero_taxed_money(checkout.currency)
+    base_shipping_price = zero_money(checkout.currency)
+
+    # when
+    _ = _process_shipping_data_for_order(
+        checkout_info, base_shipping_price, shipping_price, manager, lines
+    )
+
+    # then
+    new_user_address_count = customer_user.addresses.count()
+    new_address_data = warehouse_for_cc.address.as_data()
+    assert new_user_address_count == user_address_count
+    assert not customer_user.addresses.filter(**new_address_data).exists()
+
+
+def test_create_order_update_display_gross_prices(checkout_with_item, customer_user):
+    # given
+    checkout = checkout_with_item
+    channel = checkout.channel
+    tax_configuration = channel.tax_configuration
+
+    tax_configuration.display_gross_prices = False
+    tax_configuration.save()
+    tax_configuration.country_exceptions.all().delete()
+
+    manager = get_plugins_manager()
+    checkout_info = fetch_checkout_info(checkout, [], [], manager)
+    lines, _ = fetch_checkout_lines(checkout)
+    order_data = _prepare_order_data(
+        manager=manager,
+        checkout_info=checkout_info,
+        lines=lines,
+        discounts=[],
+        prices_entered_with_tax=True,
+    )
+
+    # when
+    order = _create_order(
+        checkout_info=checkout_info,
+        checkout_lines=lines,
+        order_data=order_data,
+        user=customer_user,
+        app=None,
+        manager=manager,
+    )
+
+    # then
+    assert not order.display_gross_prices
+
+
+def test_create_order_store_shipping_prices(
+    checkout_with_items_and_shipping, shipping_method, customer_user
+):
+    # given
+    checkout = checkout_with_items_and_shipping
+
+    expected_base_shipping_price = shipping_method.channel_listings.get(
+        channel=checkout.channel
+    ).price
+    expected_shipping_price = TaxedMoney(
+        net=expected_base_shipping_price * Decimal("0.9"),
+        gross=expected_base_shipping_price,
+    )
+    expected_shipping_tax_rate = Decimal("0.1")
+
+    manager = get_plugins_manager()
+    manager.get_checkout_shipping_tax_rate = mock.Mock(
+        return_value=expected_shipping_tax_rate
+    )
+    manager.calculate_checkout_shipping = mock.Mock(
+        return_value=expected_shipping_price
+    )
+
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+
+    # when
+    order = _create_order(
+        checkout_info=checkout_info,
+        checkout_lines=lines,
+        order_data=_prepare_order_data(
+            manager=manager,
+            checkout_info=checkout_info,
+            lines=lines,
+            discounts=None,
+            prices_entered_with_tax=True,
+        ),
+        user=customer_user,
+        app=None,
+        manager=manager,
+    )
+
+    # then
+    assert order.base_shipping_price == expected_base_shipping_price
+    assert order.shipping_price == expected_shipping_price
+    manager.calculate_checkout_shipping.assert_called_once_with(
+        checkout_info, lines, checkout.shipping_address, []
+    )
+    assert order.shipping_tax_rate == expected_shipping_tax_rate
+    manager.get_checkout_shipping_tax_rate.assert_called_once_with(
+        checkout_info, lines, checkout.shipping_address, [], expected_shipping_price
+    )
+
+
+def test_create_order_store_shipping_prices_with_free_shipping_voucher(
+    checkout_with_voucher_free_shipping,
+    shipping_method,
+    customer_user,
+):
+    # given
+    checkout = checkout_with_voucher_free_shipping
+    manager = get_plugins_manager()
+
+    expected_base_shipping_price = zero_money(checkout.currency)
+    expected_shipping_price = zero_taxed_money(checkout.currency)
+    expected_shipping_tax_rate = Decimal("0.0")
+
+    manager.get_checkout_shipping_tax_rate = mock.Mock(
+        return_value=expected_shipping_tax_rate
+    )
+    manager.calculate_checkout_shipping = mock.Mock(
+        return_value=expected_shipping_price
+    )
+
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+
+    # when
+    order = _create_order(
+        checkout_info=checkout_info,
+        checkout_lines=lines,
+        order_data=_prepare_order_data(
+            manager=manager,
+            checkout_info=checkout_info,
+            lines=lines,
+            discounts=None,
+            prices_entered_with_tax=True,
+        ),
+        user=customer_user,
+        app=None,
+        manager=manager,
+    )
+
+    # then
+    assert order.base_shipping_price == expected_base_shipping_price
+    assert order.shipping_price == expected_shipping_price
+    manager.calculate_checkout_shipping.assert_called_once_with(
+        checkout_info, lines, checkout.shipping_address, []
+    )
+    assert order.shipping_tax_rate == expected_shipping_tax_rate
+    manager.get_checkout_shipping_tax_rate.assert_called_once_with(
+        checkout_info, lines, checkout.shipping_address, [], expected_shipping_price
+    )
+
+
+@mock.patch("saleor.payment.gateway.payment_refund_or_void")
+def test_complete_checkout_invalid_shipping_method(
+    mocked_payment_refund_or_void,
+    voucher,
+    customer_user,
+    checkout_ready_to_complete,
+    app,
+    payment_txn_to_confirm,
+):
+    """Ensure that when an error in _prepare_checkout method is raised
+    the method for refund or void is called."""
+    # given
+    checkout = checkout_ready_to_complete
+
+    payment = Payment.objects.create(
+        gateway="mirumee.payments.dummy", is_active=True, checkout=checkout
+    )
+    payment.to_confirm = True
+    payment.save()
+
+    checkout.user = customer_user
+    checkout.billing_address = customer_user.default_billing_address
+    checkout.shipping_address = customer_user.default_billing_address
+    checkout.tracking_code = ""
+    checkout.redirect_url = "https://www.example.com"
+
+    checkout.voucher_code = voucher.code
+    checkout.save()
+
+    # make the current shipping method invalid
+    checkout.shipping_method.channel_listings.filter(channel=checkout.channel).delete()
+
+    voucher.apply_once_per_customer = True
+    voucher.save()
+    manager = get_plugins_manager()
+    lines, _ = fetch_checkout_lines(checkout)
+    checkout_info = fetch_checkout_info(checkout, lines, [], manager)
+
+    # when
+    with pytest.raises(ValidationError):
+        order, action_required, _ = complete_checkout(
+            checkout_info=checkout_info,
+            manager=manager,
+            lines=lines,
+            payment_data={},
+            store_source=False,
+            discounts=None,
+            user=customer_user,
+            app=app,
+        )
+
+        # then
+        voucher_customer = VoucherCustomer.objects.filter(
+            voucher=voucher, customer_email=customer_user.email
+        )
+        assert not order
+        assert action_required is True
+        assert not voucher_customer.exists()
+
+    mocked_payment_refund_or_void.called_once_with(
+        payment, manager, channel_slug=checkout.channel.slug
+    )

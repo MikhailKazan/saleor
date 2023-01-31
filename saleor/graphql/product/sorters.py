@@ -2,7 +2,7 @@ import graphene
 from django.db.models import (
     BooleanField,
     Count,
-    DateField,
+    DateTimeField,
     ExpressionWrapper,
     F,
     IntegerField,
@@ -21,7 +21,7 @@ from ...product.models import (
     Product,
     ProductChannelListing,
 )
-from ..core.descriptions import DEPRECATED_IN_3X_INPUT
+from ..core.descriptions import ADDED_IN_38, CHANNEL_REQUIRED, DEPRECATED_IN_3X_INPUT
 from ..core.types import ChannelSortInputObjectType, SortInputObjectType
 
 
@@ -40,7 +40,7 @@ class CategorySortField(graphene.Enum):
         ]:
             sort_name = self.name.lower().replace("_", " ")
             return f"Sort categories by {sort_name}."
-        raise ValueError("Unsupported enum value: %s" % self.value)
+        raise ValueError(f"Unsupported enum value: {self.value}")
 
     @staticmethod
     def qs_with_product_count(queryset: QuerySet, **_kwargs) -> QuerySet:
@@ -73,20 +73,26 @@ class CollectionSortField(graphene.Enum):
     NAME = ["name", "slug"]
     AVAILABILITY = ["is_published", "slug"]
     PRODUCT_COUNT = ["product_count", "slug"]
-    PUBLICATION_DATE = ["publication_date", "slug"]
+    PUBLICATION_DATE = ["published_at", "slug"]
+    PUBLISHED_AT = ["published_at", "slug"]
 
     @property
     def description(self):
-        # pylint: disable=no-member
-        if self in [
-            CollectionSortField.NAME,
-            CollectionSortField.AVAILABILITY,
-            CollectionSortField.PRODUCT_COUNT,
-            CollectionSortField.PUBLICATION_DATE,
-        ]:
+        descrption_extras = {
+            CollectionSortField.AVAILABILITY.name: [CHANNEL_REQUIRED],  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            CollectionSortField.PUBLICATION_DATE.name: [  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+                CHANNEL_REQUIRED,
+                DEPRECATED_IN_3X_INPUT,
+            ],
+            CollectionSortField.PUBLISHED_AT.name: [CHANNEL_REQUIRED],  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+        }
+        if self.name in CollectionSortField.__enum__._member_names_:
             sort_name = self.name.lower().replace("_", " ")
-            return f"Sort collections by {sort_name}."
-        raise ValueError("Unsupported enum value: %s" % self.value)
+            description = f"Sort collections by {sort_name}."
+            if extras := descrption_extras.get(self.name):
+                description += "".join(extras)
+            return description
+        raise ValueError(f"Unsupported enum value: {self.value}")
 
     @staticmethod
     def qs_with_product_count(queryset: QuerySet, **_kwargs) -> QuerySet:
@@ -105,13 +111,17 @@ class CollectionSortField(graphene.Enum):
 
     @staticmethod
     def qs_with_publication_date(queryset: QuerySet, channel_slug: str) -> QuerySet:
+        return CollectionSortField.qs_with_published_at(queryset, channel_slug)
+
+    @staticmethod
+    def qs_with_published_at(queryset: QuerySet, channel_slug: str) -> QuerySet:
         subquery = Subquery(
             CollectionChannelListing.objects.filter(
                 collection_id=OuterRef("pk"), channel__slug=str(channel_slug)
-            ).values_list("publication_date")[:1]
+            ).values_list("published_at")[:1]
         )
         return queryset.annotate(
-            publication_date=ExpressionWrapper(subquery, output_field=DateField())
+            published_at=ExpressionWrapper(subquery, output_field=DateTimeField())
         )
 
 
@@ -123,39 +133,58 @@ class CollectionSortingInput(ChannelSortInputObjectType):
 
 class ProductOrderField(graphene.Enum):
     NAME = ["name", "slug"]
-    RANK = ["name", "slug"]
+    RANK = ["search_rank", "id"]
     PRICE = ["min_variants_price_amount", "name", "slug"]
     MINIMAL_PRICE = ["discounted_price_amount", "name", "slug"]
+    LAST_MODIFIED = ["updated_at", "name", "slug"]
     DATE = ["updated_at", "name", "slug"]
     TYPE = ["product_type__name", "name", "slug"]
     PUBLISHED = ["is_published", "name", "slug"]
-    PUBLICATION_DATE = ["publication_date", "name", "slug"]
-    COLLECTION = ["sort_order"]
+    PUBLICATION_DATE = ["published_at", "name", "slug"]
+    PUBLISHED_AT = ["published_at", "name", "slug"]
+    LAST_MODIFIED_AT = ["updated_at", "name", "slug"]
+    COLLECTION = ["collectionproduct__sort_order", "pk"]
     RATING = ["rating", "name", "slug"]
+    CREATED_AT = ["created_at", "name", "slug"]
 
     @property
     def description(self):
         # pylint: disable=no-member
         descriptions = {
-            ProductOrderField.COLLECTION.name: (
+            ProductOrderField.COLLECTION.name: (  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
                 "collection. Note: "
                 "This option is available only for the `Collection.products` query."
+                + CHANNEL_REQUIRED
             ),
-            ProductOrderField.RANK.name: (f"rank. {DEPRECATED_IN_3X_INPUT}"),
-            ProductOrderField.NAME.name: "name.",
-            ProductOrderField.PRICE.name: "price.",
-            ProductOrderField.TYPE.name: "type.",
-            ProductOrderField.MINIMAL_PRICE.name: (
-                "a minimal price of a product's variant."
+            ProductOrderField.RANK.name: (  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+                "rank. Note: This option is available only with the `search` filter."
             ),
-            ProductOrderField.DATE.name: "update date.",
-            ProductOrderField.PUBLISHED.name: "publication status.",
-            ProductOrderField.PUBLICATION_DATE.name: "publication date.",
-            ProductOrderField.RATING.name: "rating.",
+            ProductOrderField.NAME.name: "name.",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            ProductOrderField.PRICE.name: ("price." + CHANNEL_REQUIRED),  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            ProductOrderField.TYPE.name: "type.",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            ProductOrderField.MINIMAL_PRICE.name: (  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+                "a minimal price of a product's variant." + CHANNEL_REQUIRED
+            ),
+            ProductOrderField.DATE.name: f"update date. {DEPRECATED_IN_3X_INPUT}",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            ProductOrderField.PUBLISHED.name: (  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+                "publication status." + CHANNEL_REQUIRED
+            ),
+            ProductOrderField.PUBLICATION_DATE.name: (  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+                "publication date." + CHANNEL_REQUIRED + DEPRECATED_IN_3X_INPUT
+            ),
+            ProductOrderField.LAST_MODIFIED.name: (  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+                f"update date. {DEPRECATED_IN_3X_INPUT}"
+            ),
+            ProductOrderField.PUBLISHED_AT.name: (  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+                "publication date." + CHANNEL_REQUIRED
+            ),
+            ProductOrderField.LAST_MODIFIED_AT.name: "update date.",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            ProductOrderField.RATING.name: "rating.",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            ProductOrderField.CREATED_AT.name: "creation date." + ADDED_IN_38,  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
         }
         if self.name in descriptions:
             return f"Sort products by {descriptions[self.name]}"
-        raise ValueError("Unsupported enum value: %s" % self.value)
+        raise ValueError(f"Unsupported enum value: {self.value}")
 
     @staticmethod
     def qs_with_price(queryset: QuerySet, channel_slug: str) -> QuerySet:
@@ -189,13 +218,17 @@ class ProductOrderField(graphene.Enum):
 
     @staticmethod
     def qs_with_publication_date(queryset: QuerySet, channel_slug: str) -> QuerySet:
+        return ProductOrderField.qs_with_published_at(queryset, channel_slug)
+
+    @staticmethod
+    def qs_with_published_at(queryset: QuerySet, channel_slug: str) -> QuerySet:
         subquery = Subquery(
             ProductChannelListing.objects.filter(
                 product_id=OuterRef("pk"), channel__slug=str(channel_slug)
-            ).values_list("publication_date")[:1]
+            ).values_list("published_at")[:1]
         )
         return queryset.annotate(
-            publication_date=ExpressionWrapper(subquery, output_field=DateField())
+            published_at=ExpressionWrapper(subquery, output_field=DateTimeField())
         )
 
     @staticmethod
@@ -227,6 +260,25 @@ class ProductOrder(ChannelSortInputObjectType):
         sort_enum = ProductOrderField
 
 
+class ProductVariantSortField(graphene.Enum):
+    LAST_MODIFIED_AT = ["updated_at", "name", "pk"]
+
+    @property
+    def description(self):
+        # pylint: disable=no-member
+        if self.name in ProductVariantSortField.__enum__._member_names_:
+            sort_name = self.name.lower().replace("_", " ")
+            return f"Sort products variants by {sort_name}."
+
+        raise ValueError(f"Unsupported enum value: {self.value}")
+
+
+class ProductVariantSortingInput(SortInputObjectType):
+    class Meta:
+        sort_enum = ProductVariantSortField
+        type_name = "productVariants"
+
+
 class ProductTypeSortField(graphene.Enum):
     NAME = ["name", "slug"]
     DIGITAL = ["is_digital", "name", "slug"]
@@ -236,16 +288,35 @@ class ProductTypeSortField(graphene.Enum):
     def description(self):
         # pylint: disable=no-member
         descriptions = {
-            ProductTypeSortField.NAME.name: "name",
-            ProductTypeSortField.DIGITAL.name: "type",
-            ProductTypeSortField.SHIPPING_REQUIRED.name: "shipping",
+            ProductTypeSortField.NAME.name: "name",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            ProductTypeSortField.DIGITAL.name: "type",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+            ProductTypeSortField.SHIPPING_REQUIRED.name: "shipping",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
         }
         if self.name in descriptions:
             return f"Sort products by {descriptions[self.name]}."
-        raise ValueError("Unsupported enum value: %s" % self.value)
+        raise ValueError(f"Unsupported enum value: {self.value}")
 
 
 class ProductTypeSortingInput(SortInputObjectType):
     class Meta:
         sort_enum = ProductTypeSortField
         type_name = "product types"
+
+
+class MediaChoicesSortField(graphene.Enum):
+    ID = ["id"]
+
+    @property
+    def description(self):
+        descriptions = {
+            MediaChoicesSortField.ID.name: "Sort media by ID.",  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+        }
+        if self.name in descriptions:
+            return descriptions[self.name]
+        raise ValueError(f"Unsupported enum value: {self.value}")
+
+
+class MediaSortingInput(SortInputObjectType):
+    class Meta:
+        sort_enum = MediaChoicesSortField
+        type_name = "media"

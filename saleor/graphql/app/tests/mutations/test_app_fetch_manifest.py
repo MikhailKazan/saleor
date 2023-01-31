@@ -4,7 +4,7 @@ import pytest
 import requests
 
 from ....tests.utils import assert_no_permission, get_graphql_content
-from ...enums import AppExtensionTargetEnum, AppExtensionTypeEnum, AppExtensionViewEnum
+from ...enums import AppExtensionMountEnum, AppExtensionTargetEnum
 
 APP_FETCH_MANIFEST_MUTATION = """
 mutation AppFetchManifest($manifest_url: String!){
@@ -24,11 +24,11 @@ mutation AppFetchManifest($manifest_url: String!){
       permissions{
         code
       }
+      audience
       extensions{
         label
         url
-        view
-        type
+        mount
         target
         permissions{
           code
@@ -77,6 +77,27 @@ def test_app_fetch_manifest(staff_api_client, staff_user, permission_manage_apps
         "MANAGE_ORDERS",
         "MANAGE_USERS",
     }
+
+
+@pytest.mark.vcr
+def test_app_fetch_manifest_with_audience(
+    staff_api_client, staff_user, permission_manage_apps
+):
+    manifest_url = "http://localhost:3000/manifest"
+    query = APP_FETCH_MANIFEST_MUTATION
+    variables = {
+        "manifest_url": manifest_url,
+    }
+    staff_user.user_permissions.set([permission_manage_apps])
+    response = staff_api_client.post_graphql(
+        query,
+        variables=variables,
+    )
+    content = get_graphql_content(response)
+    errors = content["data"]["appFetchManifest"]["errors"]
+    manifest = content["data"]["appFetchManifest"]["manifest"]
+    assert not errors
+    assert manifest["audience"] == "http://localhost:8888/app"
 
 
 def test_app_fetch_manifest_missing_permission(staff_api_client, staff_user):
@@ -148,7 +169,9 @@ def test_app_fetch_manifest_timeout(
 ):
     mocked_request = Mock()
     mocked_request.side_effect = requests.Timeout()
-    monkeypatch.setattr("saleor.graphql.app.mutations.requests.get", mocked_request)
+    monkeypatch.setattr(
+        "saleor.graphql.app.mutations.app_fetch_manifest.requests.get", mocked_request
+    )
     manifest_url = "http://localhost:3000/manifest-doesnt-exist"
     query = APP_FETCH_MANIFEST_MUTATION
     variables = {
@@ -268,9 +291,7 @@ def test_app_fetch_manifest_missing_fields(
     [
         "label",
         "url",
-        "view",
-        "type",
-        "target",
+        "mount",
     ],
 )
 def test_app_fetch_manifest_missing_extension_fields(
@@ -282,9 +303,7 @@ def test_app_fetch_manifest_missing_extension_fields(
             "permissions": ["MANAGE_PRODUCTS"],
             "label": "Create product with App",
             "url": "http://127.0.0.1:9090/app-extension",
-            "view": AppExtensionViewEnum.PRODUCT.name,
-            "type": AppExtensionTypeEnum.OVERVIEW.name,
-            "target": AppExtensionTargetEnum.CREATE.name,
+            "mount": AppExtensionMountEnum.PRODUCT_OVERVIEW_CREATE.name,
         }
     ]
     del app_manifest["extensions"][0][missing_field]
@@ -317,11 +336,7 @@ def test_app_fetch_manifest_missing_extension_fields(
 
 @pytest.mark.parametrize(
     "incorrect_field",
-    [
-        "view",
-        "type",
-        "target",
-    ],
+    ["target", "mount"],
 )
 def test_app_fetch_manifest_extensions_incorrect_enum_values(
     incorrect_field, app_manifest, monkeypatch, staff_api_client, permission_manage_apps
@@ -332,9 +347,7 @@ def test_app_fetch_manifest_extensions_incorrect_enum_values(
             "permissions": ["MANAGE_PRODUCTS"],
             "label": "Create product with App",
             "url": "http://127.0.0.1:9090/app-extension",
-            "view": AppExtensionViewEnum.PRODUCT.name,
-            "type": AppExtensionTypeEnum.OVERVIEW.name,
-            "target": AppExtensionTargetEnum.CREATE.name,
+            "mount": AppExtensionMountEnum.PRODUCT_OVERVIEW_CREATE.name,
         }
     ]
     app_manifest["extensions"][0][incorrect_field] = "INCORRECT_VALUE"
@@ -358,39 +371,82 @@ def test_app_fetch_manifest_extensions_incorrect_enum_values(
     content = get_graphql_content(response)
     errors = content["data"]["appFetchManifest"]["errors"]
 
-    assert len(errors) == 2
+    assert len(errors) == 1
     expected_errors = [
         {
             "code": "INVALID",
             "field": "extensions",
             "message": f"Incorrect value for field: {incorrect_field}",
         },
-        {
-            "field": "extensions",
-            "message": (
-                "Incorrect configuration of app extension for fields: view, type and "
-                "target."
-            ),
-            "code": "INVALID",
-        },
     ]
 
-    assert errors[0] in expected_errors
-    assert errors[1] in expected_errors
+    assert errors == expected_errors
 
 
 @pytest.mark.parametrize(
-    "url",
+    "url, target, app_url",
     [
-        "http:/127.0.0.1:8080/app",
-        "127.0.0.1:8080/app",
-        "",
-        "/app",
-        "www.example.com/app",
+        ("/app", AppExtensionTargetEnum.APP_PAGE.name, ""),
+        ("/app", AppExtensionTargetEnum.APP_PAGE.name, "https://www.example.com/app"),
+        ("/app", AppExtensionTargetEnum.POPUP.name, "https://www.example.com/app"),
+    ],
+)
+def test_app_fetch_manifest_extensions_correct_url(
+    url,
+    target,
+    app_url,
+    app_manifest,
+    monkeypatch,
+    staff_api_client,
+    permission_manage_apps,
+):
+    # given
+    app_manifest["appUrl"] = app_url
+    app_manifest["extensions"] = [
+        {
+            "permissions": ["MANAGE_PRODUCTS"],
+            "label": "Create product with App",
+            "url": url,
+            "mount": AppExtensionMountEnum.PRODUCT_OVERVIEW_CREATE.name,
+            "target": target,
+        }
+    ]
+
+    mocked_get_response = Mock()
+    mocked_get_response.json.return_value = app_manifest
+
+    monkeypatch.setattr(requests, "get", Mock(return_value=mocked_get_response))
+    query = APP_FETCH_MANIFEST_MUTATION
+    manifest_url = "http://localhost:3000/configuration/manifest"
+    variables = {
+        "manifest_url": manifest_url,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables=variables, permissions=[permission_manage_apps]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    errors = content["data"]["appFetchManifest"]["errors"]
+    assert len(errors) == 0
+
+
+@pytest.mark.parametrize(
+    "url, target",
+    [
+        ("http:/127.0.0.1:8080/app", AppExtensionTargetEnum.POPUP.name),
+        ("127.0.0.1:8080/app", AppExtensionTargetEnum.POPUP.name),
+        ("", AppExtensionTargetEnum.POPUP.name),
+        ("/app", AppExtensionTargetEnum.POPUP.name),
+        ("www.example.com/app", AppExtensionTargetEnum.POPUP.name),
+        ("https://www.example.com/app", AppExtensionTargetEnum.APP_PAGE.name),
+        ("http://www.example.com/app", AppExtensionTargetEnum.APP_PAGE.name),
     ],
 )
 def test_app_fetch_manifest_extensions_incorrect_url(
-    url, app_manifest, monkeypatch, staff_api_client, permission_manage_apps
+    url, target, app_manifest, monkeypatch, staff_api_client, permission_manage_apps
 ):
     # given
     app_manifest["extensions"] = [
@@ -398,9 +454,8 @@ def test_app_fetch_manifest_extensions_incorrect_url(
             "permissions": ["MANAGE_PRODUCTS"],
             "label": "Create product with App",
             "url": url,
-            "view": AppExtensionViewEnum.PRODUCT.name,
-            "type": AppExtensionTypeEnum.OVERVIEW.name,
-            "target": AppExtensionTargetEnum.CREATE.name,
+            "mount": AppExtensionMountEnum.PRODUCT_OVERVIEW_CREATE.name,
+            "target": target,
         }
     ]
 
@@ -453,9 +508,7 @@ def test_app_fetch_manifest_extensions_permission_out_of_scope(
             "permissions": extension_permissions,
             "label": "Create product with App",
             "url": "http://127.0.0.1:8080/app",
-            "view": AppExtensionViewEnum.PRODUCT.name,
-            "type": AppExtensionTypeEnum.OVERVIEW.name,
-            "target": AppExtensionTargetEnum.CREATE.name,
+            "mount": AppExtensionMountEnum.PRODUCT_OVERVIEW_CREATE.name,
         }
     ]
 
@@ -496,9 +549,7 @@ def test_app_fetch_manifest_extensions_invalid_permission(
             "permissions": ["incorrect_permission"],
             "label": "Create product with App",
             "url": "http://127.0.0.1:8080/app",
-            "view": AppExtensionViewEnum.PRODUCT.name,
-            "type": AppExtensionTypeEnum.OVERVIEW.name,
-            "target": AppExtensionTargetEnum.CREATE.name,
+            "mount": AppExtensionMountEnum.PRODUCT_OVERVIEW_CREATE.name,
         }
     ]
 
@@ -540,9 +591,7 @@ def test_app_fetch_manifest_with_extensions(
             "permissions": ["MANAGE_PRODUCTS"],
             "label": "Create product with App",
             "url": "http://127.0.0.1:8080/app",
-            "view": AppExtensionViewEnum.PRODUCT.name,
-            "type": AppExtensionTypeEnum.OVERVIEW.name,
-            "target": AppExtensionTargetEnum.CREATE.name,
+            "mount": AppExtensionMountEnum.PRODUCT_OVERVIEW_CREATE.name,
         }
     ]
 
@@ -576,6 +625,5 @@ def test_app_fetch_manifest_with_extensions(
     ]
     assert extension["label"] == "Create product with App"
     assert extension["url"] == "http://127.0.0.1:8080/app"
-    assert extension["view"] == AppExtensionViewEnum.PRODUCT.name
-    assert extension["type"] == AppExtensionTypeEnum.OVERVIEW.name
-    assert extension["target"] == AppExtensionTargetEnum.CREATE.name
+    assert extension["mount"] == AppExtensionMountEnum.PRODUCT_OVERVIEW_CREATE.name
+    assert extension["target"] == AppExtensionTargetEnum.POPUP.name

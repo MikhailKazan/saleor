@@ -3,10 +3,10 @@ from decimal import Decimal
 from unittest.mock import Mock, patch
 
 import pytest
-from django.contrib.auth.models import AnonymousUser
 
 from ...checkout.calculations import checkout_total
 from ...checkout.fetch import fetch_checkout_info, fetch_checkout_lines
+from ...core.prices import quantize_price
 from ...plugins.manager import PluginsManager, get_plugins_manager
 from .. import (
     ChargeStatus,
@@ -17,7 +17,7 @@ from .. import (
     gateway,
 )
 from ..error_codes import PaymentErrorCode
-from ..interface import GatewayResponse, PaymentMethodInfo
+from ..interface import GatewayResponse, PaymentMethodInfo, TransactionData
 from ..models import Payment
 from ..utils import (
     ALLOWED_GATEWAY_KINDS,
@@ -80,6 +80,19 @@ def transaction_data(payment_dummy, gateway_response):
 
 
 @pytest.fixture
+def transaction_data_long_error_message(payment_dummy):
+    error_msg = "This is very very long response from payment gateway. " * 10
+    return {
+        "payment": payment_dummy,
+        "payment_information": create_payment_information(
+            payment_dummy, "payment-token"
+        ),
+        "error_msg": error_msg,
+        "kind": TransactionKind.CAPTURE_FAILED,
+    }
+
+
+@pytest.fixture
 def transaction_token():
     return "transaction-token"
 
@@ -104,7 +117,7 @@ def test_create_payment(checkout_with_item, address):
     checkout_with_item.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout_with_item)
+    lines, _ = fetch_checkout_lines(checkout_with_item)
     checkout_info = fetch_checkout_info(checkout_with_item, lines, [], manager)
     total = checkout_total(
         manager=manager, checkout_info=checkout_info, lines=lines, address=address
@@ -145,7 +158,7 @@ def test_create_payment_from_checkout_requires_billing_address(checkout_with_ite
     checkout_with_item.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout_with_item)
+    lines, _ = fetch_checkout_lines(checkout_with_item)
     checkout_info = fetch_checkout_info(checkout_with_item, lines, [], manager)
     total = checkout_total(
         manager=manager, checkout_info=checkout_info, lines=lines, address=None
@@ -187,7 +200,7 @@ def test_create_payment_information_for_checkout_payment(address, checkout_with_
     checkout_with_item.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout_with_item)
+    lines, _ = fetch_checkout_lines(checkout_with_item)
     checkout_info = fetch_checkout_info(checkout_with_item, lines, [], manager)
     total = checkout_total(
         manager=manager, checkout_info=checkout_info, lines=lines, address=address
@@ -249,14 +262,46 @@ def test_create_payment_information_for_empty_payment(payment_dummy):
 
 def test_create_payment_information_for_checkout_metadata(payment_dummy, checkout):
     metadata = {"test_key": "test_val"}
-    checkout.metadata = metadata
-    checkout.save(update_fields=["metadata"])
+    checkout.metadata_storage.metadata = metadata
+    checkout.metadata_storage.save(update_fields=["metadata"])
     payment_dummy.order = None
     payment_dummy.checkout = checkout
     payment_dummy.save(update_fields=["order", "checkout"])
 
     payment_info = create_payment_information(payment_dummy)
     assert payment_info.checkout_metadata == metadata
+
+
+def test_create_payment_information_for_payment_with_transactions(payment_dummy):
+    # given
+    payment_dummy.transactions.create(
+        amount=payment_dummy.total,
+        currency=payment_dummy.currency,
+        kind=TransactionKind.AUTH,
+        gateway_response={"status": "SUCCESS"},
+        is_success=True,
+    )
+
+    # when
+    payment_info = create_payment_information(payment_dummy)
+
+    # then
+    for transaction in payment_dummy.transactions.all():
+        assert (
+            TransactionData(
+                token=transaction.token,
+                is_success=transaction.is_success,
+                kind=transaction.kind,
+                gateway_response=transaction.gateway_response,
+                amount={
+                    "amount": str(
+                        quantize_price(transaction.amount, transaction.currency)
+                    ),
+                    "currency": transaction.currency,
+                },
+            )
+            in payment_info.transactions
+        )
 
 
 def test_create_payment_information_for_draft_order(draft_order):
@@ -291,7 +336,7 @@ def test_create_payment_information_store(checkout_with_item, address, store):
     checkout_with_item.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout_with_item)
+    lines, _ = fetch_checkout_lines(checkout_with_item)
     checkout_info = fetch_checkout_info(checkout_with_item, lines, [], manager)
     total = checkout_total(
         manager=manager, checkout_info=checkout_info, lines=lines, address=address
@@ -326,7 +371,7 @@ def test_create_payment_information_metadata(checkout_with_item, address, metada
     checkout_with_item.save()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout_with_item)
+    lines, _ = fetch_checkout_lines(checkout_with_item)
     checkout_info = fetch_checkout_info(checkout_with_item, lines, [], manager)
     total = checkout_total(
         manager=manager, checkout_info=checkout_info, lines=lines, address=address
@@ -364,21 +409,18 @@ def test_create_transaction(transaction_data):
     assert txn.gateway_response == gateway_response.raw_response
 
 
+def test_create_transaction_long_error_message(transaction_data_long_error_message):
+    transaction_data = transaction_data_long_error_message
+    txn = create_transaction(**transaction_data)
+
+    assert txn.payment == transaction_data["payment"]
+    assert txn.error == transaction_data["error_msg"]
+
+
 def test_create_transaction_no_gateway_response(transaction_data):
     transaction_data.pop("gateway_response")
     txn = create_transaction(**transaction_data)
     assert txn.gateway_response == {}
-
-
-@pytest.mark.parametrize(
-    "func",
-    [gateway.authorize, gateway.capture, gateway.confirm, gateway.refund, gateway.void],
-)
-def test_payment_needs_to_be_active_for_any_action(func, payment_dummy):
-    payment_dummy.is_active = False
-    with pytest.raises(PaymentError) as exc:
-        func(payment_dummy, "token")
-    assert exc.value.message == NOT_ACTIVE_PAYMENT_ERROR
 
 
 @patch.object(PluginsManager, "capture_payment")
@@ -560,7 +602,7 @@ def test_can_void(payment_txn_preauth: Payment):
     assert payment_txn_preauth.charge_status == ChargeStatus.NOT_CHARGED
 
     payment_txn_preauth.is_active = False
-    assert not payment_txn_preauth.can_void()
+    assert payment_txn_preauth.can_void()
 
     payment_txn_preauth.is_active = True
     assert payment_txn_preauth.can_void()
@@ -597,7 +639,6 @@ def test_payment_get_authorized_amount(payment_txn_preauth):
 
     authorized_amount = payment.transactions.first().amount
     assert payment.get_authorized_amount().amount == authorized_amount
-    assert payment.order.total_authorized.amount == authorized_amount
 
     payment.transactions.create(
         amount=payment.total,
@@ -730,7 +771,7 @@ def test_payment_is_not_owned_by_user_for_checkout(payment, checkout, customer_u
 
 def test_payment_owned_by_user_anonymous_user(payment):
     # given
-    user = AnonymousUser()
+    user = None
 
     # when
     is_owned = payment_owned_by_user(payment.pk, user)

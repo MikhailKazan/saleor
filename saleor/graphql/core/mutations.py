@@ -1,7 +1,22 @@
-import os
+import os.path
 import secrets
+from enum import Enum
 from itertools import chain
-from typing import Iterable, Tuple, Union
+from typing import (
+    Any,
+    Collection,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+    overload,
+)
+from uuid import UUID
 
 import graphene
 from django.core.exceptions import (
@@ -10,19 +25,39 @@ from django.core.exceptions import (
     ValidationError,
 )
 from django.core.files.storage import default_storage
+from django.core.files.uploadedfile import UploadedFile
+from django.db.models import Model, Q, QuerySet
 from django.db.models.fields.files import FileField
 from graphene import ObjectType
 from graphene.types.mutation import MutationOptions
 from graphql.error import GraphQLError
 
-from ...core.db.utils import set_mutation_flag_in_context
+from ...core.error_codes import MetadataErrorCode
 from ...core.exceptions import PermissionDenied
-from ...core.permissions import AccountPermissions
-from ..decorators import staff_member_or_app_required
+from ...core.utils.events import call_event
+from ...permission.auth_filters import AuthorizationFilters
+from ...permission.enums import BasePermissionEnum
+from ...permission.utils import (
+    message_one_of_permissions_required,
+    one_of_permissions_or_auth_filter_required,
+)
+from ..core import ResolveInfo
+from ..core.utils import ext_ref_to_global_id_or_error
+from ..core.validators import validate_one_of_args_is_in_mutation
+from ..meta.permissions import PRIVATE_META_PERMISSION_MAP, PUBLIC_META_PERMISSION_MAP
+from ..payment.utils import metadata_contains_empty_key
+from ..plugins.dataloaders import get_plugin_manager_promise
 from ..utils import get_nodes, resolve_global_ids_to_primary_keys
+from .context import set_mutation_flag_in_context, setup_context_user
 from .descriptions import DEPRECATED_IN_3X_FIELD
-from .types import File, Upload
-from .types.common import UploadError
+from .types import (
+    TYPES_WITH_DOUBLE_ID_AVAILABLE,
+    File,
+    ModelObjectType,
+    NonNullList,
+    Upload,
+    UploadError,
+)
 from .utils import from_global_id_or_error, snake_to_camel_case
 from .utils.error_codes import get_error_code_from_error
 
@@ -35,8 +70,8 @@ def get_model_name(model):
 
 def get_error_fields(error_type_class, error_type_field, deprecation_reason=None):
     error_field = graphene.Field(
-        graphene.List(
-            graphene.NonNull(error_type_class),
+        NonNullList(
+            error_type_class,
             description="List of errors that occurred executing the mutation.",
         ),
         default_value=[],
@@ -55,8 +90,12 @@ def validation_error_to_error_type(
     error_class_fields = set(error_type_class._meta.fields.keys())
     if hasattr(validation_error, "error_dict"):
         # convert field errors
-        for field, field_errors in validation_error.error_dict.items():
-            field = None if field == NON_FIELD_ERRORS else snake_to_camel_case(field)
+        for field_label, field_errors in validation_error.error_dict.items():
+            field = (
+                None
+                if field_label == NON_FIELD_ERRORS
+                else snake_to_camel_case(field_label)
+            )
             for err in field_errors:
                 error = error_type_class(
                     field=field,
@@ -77,7 +116,7 @@ def validation_error_to_error_type(
     return err_list
 
 
-def attach_error_params(error, params: dict, error_class_fields: set):
+def attach_error_params(error, params: Optional[dict], error_class_fields: set):
     if not params:
         return {}
     # If some of the params key overlap with error class fields
@@ -94,19 +133,37 @@ class ModelMutationOptions(MutationOptions):
     return_field_name = None
 
 
+MT = TypeVar("MT", bound=Model)
+
+
 class BaseMutation(graphene.Mutation):
     class Meta:
         abstract = True
 
     @classmethod
+    def _validate_permissions(cls, permissions):
+        if not permissions:
+            return
+        if not isinstance(permissions, tuple):
+            raise ImproperlyConfigured(
+                f"Permissions should be a tuple in Meta class: {permissions}"
+            )
+        for p in permissions:
+            if not isinstance(p, Enum):
+                raise ImproperlyConfigured(f"Permission should be an enum: {p}.")
+
+    @classmethod
     def __init_subclass_with_meta__(
         cls,
+        auto_permission_message=True,
         description=None,
-        permissions: Tuple = None,
+        permissions: Optional[Collection[BasePermissionEnum]] = None,
         _meta=None,
         error_type_class=None,
         error_type_field=None,
         errors_mapping=None,
+        support_meta_field=False,
+        support_private_meta_field=False,
         **options,
     ):
         if not _meta:
@@ -118,21 +175,24 @@ class BaseMutation(graphene.Mutation):
         if not error_type_class:
             raise ImproperlyConfigured("No error_type_class provided in Meta.")
 
-        if isinstance(permissions, str):
-            permissions = (permissions,)
+        cls._validate_permissions(permissions)
 
-        if permissions and not isinstance(permissions, tuple):
-            raise ImproperlyConfigured(
-                "Permissions should be a tuple or a string in Meta"
-            )
-
+        _meta.auto_permission_message = auto_permission_message
         _meta.permissions = permissions
         _meta.error_type_class = error_type_class
         _meta.error_type_field = error_type_field
         _meta.errors_mapping = errors_mapping
+        _meta.support_meta_field = support_meta_field
+        _meta.support_private_meta_field = support_private_meta_field
+
+        if permissions and auto_permission_message:
+            permissions_msg = message_one_of_permissions_required(permissions)
+            description = f"{description} {permissions_msg}"
+
         super().__init_subclass_with_meta__(
             description=description, _meta=_meta, **options
         )
+
         if error_type_field:
             deprecated_msg = f"{DEPRECATED_IN_3X_FIELD} Use `errors` field instead."
             cls._meta.fields.update(
@@ -151,14 +211,30 @@ class BaseMutation(graphene.Mutation):
 
     @classmethod
     def _get_node_by_pk(
-        cls, info, graphene_type: ObjectType, pk: Union[int, str], qs=None
-    ):
+        cls,
+        info: ResolveInfo,
+        graphene_type: Type[ModelObjectType[MT]],
+        pk: Union[int, str],
+        qs=None,
+    ) -> Optional[MT]:
         """Attempt to resolve a node from the given internal ID.
 
         Whether by using the provided query set object or by calling type's get_node().
         """
         if qs is not None:
-            return qs.filter(pk=pk).first()
+            lookup = Q(pk=pk)
+            if pk is not None and str(graphene_type) in TYPES_WITH_DOUBLE_ID_AVAILABLE:
+                # This is temporary solution that allows fetching objects with use of
+                # new and old id.
+                try:
+                    UUID(str(pk))
+                except ValueError:
+                    lookup = (
+                        Q(number=pk) & Q(use_old_id=True)
+                        if str(graphene_type) == "Order"
+                        else Q(old_id=pk) & Q(old_id__isnull=False)
+                    )
+            return qs.filter(lookup).first()
         get_node = getattr(graphene_type, "get_node", None)
         if get_node:
             return get_node(info, pk)
@@ -166,7 +242,10 @@ class BaseMutation(graphene.Mutation):
 
     @classmethod
     def get_global_id_or_error(
-        cls, id: str, only_type: Union[ObjectType, str] = None, field: str = "id"
+        cls,
+        id: str,
+        only_type: Union[ObjectType, str, None] = None,
+        field: str = "id",
     ):
         try:
             _object_type, pk = from_global_id_or_error(id, only_type, raise_error=True)
@@ -176,9 +255,93 @@ class BaseMutation(graphene.Mutation):
             )
         return pk
 
+    @overload
     @classmethod
-    def get_node_or_error(cls, info, node_id, field="id", only_type=None, qs=None):
+    def get_node_or_error(
+        cls,
+        info: ResolveInfo,
+        node_id: str,
+        *,
+        field: str = "id",
+        only_type: Type[ModelObjectType[MT]],
+        qs: Any = None,
+        code: str = "not_found",
+    ) -> MT:
+        ...
+
+    @overload
+    @classmethod
+    def get_node_or_error(
+        cls,
+        info: ResolveInfo,
+        node_id: Optional[str],
+        *,
+        field: str = "id",
+        only_type: Type[ModelObjectType[MT]],
+        qs: Any = None,
+        code: str = "not_found",
+    ) -> Optional[MT]:
+        ...
+
+    @overload
+    @classmethod
+    def get_node_or_error(
+        cls,
+        info: ResolveInfo,
+        node_id: str,
+        *,
+        field: str = "id",
+        only_type: None,
+        qs: QuerySet[MT],
+        code: str = "not_found",
+    ) -> MT:
+        ...
+
+    @overload
+    @classmethod
+    def get_node_or_error(
+        cls,
+        info: ResolveInfo,
+        node_id: str,
+        *,
+        field: str = "id",
+        only_type: None = None,
+        qs: Any = None,
+        code: str = "not_found",
+    ) -> Model:
+        ...
+
+    @overload
+    @classmethod
+    def get_node_or_error(
+        cls,
+        info: ResolveInfo,
+        node_id: Optional[str],
+        *,
+        field: str = "id",
+        only_type: Any = None,
+        qs: Any = None,
+        code: str = "not_found",
+    ) -> Optional[Model]:
+        ...
+
+    @classmethod
+    def get_node_or_error(
+        cls,
+        info: ResolveInfo,
+        node_id: Optional[str],
+        *,
+        field: str = "id",
+        only_type: Optional[Type[ObjectType]] = None,
+        qs: Optional[QuerySet] = None,
+        code: str = "not_found",
+    ) -> Optional[Model]:
         if not node_id:
+            # FIXME: this is weird behavior and we should drop it
+            # the function now has three possible outcomes:
+            # * Null
+            # * the object you asked for
+            # * ValidationError
             return None
 
         try:
@@ -199,7 +362,7 @@ class BaseMutation(graphene.Mutation):
                 raise ValidationError(
                     {
                         field: ValidationError(
-                            "Couldn't resolve to a node: %s" % node_id, code="not_found"
+                            f"Couldn't resolve to a node: {node_id}", code=code
                         )
                     }
                 )
@@ -209,7 +372,7 @@ class BaseMutation(graphene.Mutation):
     def get_global_ids_or_error(
         cls,
         ids: Iterable[str],
-        only_type: Union[ObjectType, str] = None,
+        only_type: Union[ObjectType, str, None] = None,
         field: str = "ids",
     ):
         try:
@@ -222,6 +385,20 @@ class BaseMutation(graphene.Mutation):
             )
         return pks
 
+    @overload
+    @classmethod
+    def get_nodes_or_error(
+        cls, ids, field, only_type: Type[ModelObjectType[MT]], qs=None, schema=None
+    ) -> List[MT]:
+        ...
+
+    @overload
+    @classmethod
+    def get_nodes_or_error(
+        cls, ids, field, only_type: Optional[ObjectType] = None, qs=None, schema=None
+    ) -> List[Model]:
+        ...
+
     @classmethod
     def get_nodes_or_error(cls, ids, field, only_type=None, qs=None, schema=None):
         try:
@@ -233,7 +410,7 @@ class BaseMutation(graphene.Mutation):
         return instances
 
     @staticmethod
-    def remap_error_fields(validation_error, field_map):
+    def remap_error_fields(validation_error, field_map) -> None:
         """Rename validation_error fields according to provided field_map.
 
         Skips renaming fields from field_map that are not on validation_error.
@@ -247,7 +424,7 @@ class BaseMutation(graphene.Mutation):
                 pass
 
     @classmethod
-    def clean_instance(cls, info, instance):
+    def clean_instance(cls, info: ResolveInfo, instance, /) -> None:
         """Clean the instance that was created using the input data.
 
         Once an instance is created, this method runs `full_clean()` to perform
@@ -316,24 +493,25 @@ class BaseMutation(graphene.Mutation):
 
         The `context` parameter is the Context instance associated with the request.
         """
-        permissions = permissions or cls._meta.permissions
-        if not permissions:
+        all_permissions = permissions or cls._meta.permissions
+        if not all_permissions:
             return True
-        if context.user.has_perms(permissions):
-            return True
-        app = getattr(context, "app", None)
-        if app:
-            # for now MANAGE_STAFF permission for app is not supported
-            if AccountPermissions.MANAGE_STAFF in permissions:
-                return False
-            return app.has_perms(permissions)
-        return False
+
+        return one_of_permissions_or_auth_filter_required(context, all_permissions)
 
     @classmethod
-    def mutate(cls, root, info, **data):
+    def mutate(cls, root, info: ResolveInfo, **data):
         set_mutation_flag_in_context(info.context)
+        setup_context_user(info.context)
+
         if not cls.check_permissions(info.context):
-            raise PermissionDenied()
+            raise PermissionDenied(permissions=cls._meta.permissions)
+        manager = get_plugin_manager_promise(info.context).get()
+        result = manager.perform_mutation(
+            mutation_cls=cls, root=root, info=info, data=data
+        )
+        if result is not None:
+            return result
 
         try:
             response = cls.perform_mutation(root, info, **data)
@@ -344,8 +522,8 @@ class BaseMutation(graphene.Mutation):
             return cls.handle_errors(e)
 
     @classmethod
-    def perform_mutation(cls, root, info, **data):
-        pass
+    def perform_mutation(cls, _root, _info: ResolveInfo, /):
+        raise NotImplementedError()
 
     @classmethod
     def handle_errors(cls, error: ValidationError, **extra):
@@ -358,6 +536,81 @@ class BaseMutation(graphene.Mutation):
         if cls._meta.error_type_field is not None:
             extra.update({cls._meta.error_type_field: errors})
         return cls(errors=errors, **extra)
+
+    @staticmethod
+    def call_event(func_obj, *func_args):
+        return call_event(func_obj, *func_args)
+
+    @classmethod
+    def update_metadata(cls, instance, meta_data_list: List, is_private: bool = False):
+        if is_private:
+            instance.store_value_in_private_metadata(
+                {data.key: data.value for data in meta_data_list}
+            )
+        else:
+            instance.store_value_in_metadata(
+                {data.key: data.value for data in meta_data_list}
+            )
+
+    @classmethod
+    def validate_metadata_keys(cls, metadata_list: List[dict]):
+        if metadata_contains_empty_key(metadata_list):
+            raise ValidationError(
+                {
+                    "input": ValidationError(
+                        "Metadata key cannot be empty.",
+                        code=MetadataErrorCode.REQUIRED.value,
+                    )
+                }
+            )
+
+    @classmethod
+    def validate_and_update_metadata(
+        cls, instance, metadata_list, private_metadata_list
+    ):
+        if cls._meta.support_meta_field and metadata_list is not None:
+            cls.validate_metadata_keys(metadata_list)
+            cls.update_metadata(instance, metadata_list)
+        if cls._meta.support_private_meta_field and private_metadata_list is not None:
+            cls.validate_metadata_keys(private_metadata_list)
+            cls.update_metadata(instance, private_metadata_list, is_private=True)
+
+    @classmethod
+    def check_metadata_permissions(cls, info: ResolveInfo, object_id, private=False):
+        type_name, db_id = graphene.Node.from_global_id(object_id)
+
+        if private:
+            meta_permission = PRIVATE_META_PERMISSION_MAP.get(type_name)
+        else:
+            meta_permission = PUBLIC_META_PERMISSION_MAP.get(type_name)
+
+        if not meta_permission:
+            raise NotImplementedError(
+                f"Couldn't resolve permission to item type: {type_name}. "
+            )
+
+
+def is_list_of_ids(field) -> bool:
+    if isinstance(field.type, graphene.List):
+        of_type = field.type.of_type
+        if isinstance(of_type, graphene.NonNull):
+            of_type = of_type.of_type
+        return of_type == graphene.ID
+    return False
+
+
+def is_id_field(field) -> bool:
+    return (
+        field.type == graphene.ID
+        or isinstance(field.type, graphene.NonNull)
+        and field.type.of_type == graphene.ID
+    )
+
+
+def is_upload_field(field) -> bool:
+    if hasattr(field.type, "of_type"):
+        return field.type.of_type == Upload
+    return field.type == Upload
 
 
 class ModelMutation(BaseMutation):
@@ -405,7 +658,7 @@ class ModelMutation(BaseMutation):
         cls._update_mutation_arguments_and_fields(arguments=arguments, fields=fields)
 
     @classmethod
-    def clean_input(cls, info, instance, data, input_cls=None):
+    def clean_input(cls, info: ResolveInfo, instance, data, *, input_cls=None):
         """Clean input data received from mutation arguments.
 
         Fields containing IDs or lists of IDs are automatically resolved into
@@ -416,26 +669,6 @@ class ModelMutation(BaseMutation):
         Override this method to provide custom transformations of incoming
         data.
         """
-
-        def is_list_of_ids(field):
-            if isinstance(field.type, graphene.List):
-                of_type = field.type.of_type
-                if isinstance(of_type, graphene.NonNull):
-                    of_type = of_type.of_type
-                return of_type == graphene.ID
-            return False
-
-        def is_id_field(field):
-            return (
-                field.type == graphene.ID
-                or isinstance(field.type, graphene.NonNull)
-                and field.type.of_type == graphene.ID
-            )
-
-        def is_upload_field(field):
-            if hasattr(field.type, "of_type"):
-                return field.type.of_type == Upload
-            return field.type == Upload
 
         if not input_cls:
             input_cls = getattr(cls.Arguments, "input")
@@ -456,7 +689,7 @@ class ModelMutation(BaseMutation):
 
                 # handle ID field
                 elif value is not None and is_id_field(field_item):
-                    instance = cls.get_node_or_error(info, value, field_name)
+                    instance = cls.get_node_or_error(info, value, field=field_name)
                     cleaned_input[field_name] = instance
 
                 # handle uploaded files
@@ -470,7 +703,7 @@ class ModelMutation(BaseMutation):
         return cleaned_input
 
     @classmethod
-    def _save_m2m(cls, info, instance, cleaned_data):
+    def _save_m2m(cls, _info: ResolveInfo, instance, cleaned_data):
         opts = instance._meta
         for f in chain(opts.many_to_many, opts.private_fields):
             if not hasattr(f, "save_form_data"):
@@ -484,7 +717,7 @@ class ModelMutation(BaseMutation):
         return cls(**{cls._meta.return_field_name: instance, "errors": []})
 
     @classmethod
-    def save(cls, info, instance, cleaned_input):
+    def save(cls, _info: ResolveInfo, instance, _cleaned_input, /):
         instance.save()
 
     @classmethod
@@ -499,7 +732,7 @@ class ModelMutation(BaseMutation):
         return cls._meta.object_type
 
     @classmethod
-    def get_instance(cls, info, **data):
+    def get_instance(cls, info: ResolveInfo, **data):
         """Retrieve an instance from the supplied global id.
 
         The expected graphene type can be lazy (str).
@@ -516,12 +749,12 @@ class ModelMutation(BaseMutation):
         return instance
 
     @classmethod
-    def post_save_action(cls, info, instance, cleaned_input):
+    def post_save_action(cls, info: ResolveInfo, instance, cleaned_input):
         """Perform an action after saving an object and its m2m."""
         pass
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
         """Perform model mutation.
 
         Depending on the input data, `mutate` either creates a new instance or
@@ -532,7 +765,11 @@ class ModelMutation(BaseMutation):
         instance = cls.get_instance(info, **data)
         data = data.get("input")
         cleaned_input = cls.clean_input(info, instance, data)
+        metadata_list = cleaned_input.pop("metadata", None)
+        private_metadata_list = cleaned_input.pop("private_metadata", None)
         instance = cls.construct_instance(instance, cleaned_input)
+
+        cls.validate_and_update_metadata(instance, metadata_list, private_metadata_list)
         cls.clean_instance(info, instance)
         cls.save(info, instance, cleaned_input)
         cls._save_m2m(info, instance, cleaned_input)
@@ -540,12 +777,42 @@ class ModelMutation(BaseMutation):
         return cls.success_response(instance)
 
 
+class ModelWithExtRefMutation(ModelMutation):
+    class Meta:
+        abstract = True
+
+    @classmethod
+    def get_object_id(cls, **data):
+        """Resolve object id by given id or external reference."""
+        object_id, ext_ref = data.get("id"), data.get("external_reference")
+        validate_one_of_args_is_in_mutation(
+            "id", object_id, "external_reference", ext_ref
+        )
+
+        if ext_ref and not object_id:
+            object_id = ext_ref_to_global_id_or_error(cls._meta.model, ext_ref)
+
+        return object_id
+
+    @classmethod
+    def get_instance(cls, info, **data):
+        """Retrieve an instance from the supplied global id.
+
+        The expected graphene type can be lazy (str).
+        """
+        object_id = cls.get_object_id(**data)
+        qs = data.get("qs")
+        if object_id:
+            model_type = cls.get_type_for_model()
+            return cls.get_node_or_error(info, object_id, only_type=model_type, qs=qs)
+
+
 class ModelDeleteMutation(ModelMutation):
     class Meta:
         abstract = True
 
     @classmethod
-    def clean_instance(cls, info, instance):
+    def clean_instance(cls, _info: ResolveInfo, _instance, /):
         """Perform additional logic before deleting the model instance.
 
         Override this method to raise custom validation error and abort
@@ -553,24 +820,20 @@ class ModelDeleteMutation(ModelMutation):
         """
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, external_reference=None, id=None
+    ):
         """Perform a mutation that deletes a model instance."""
-        if not cls.check_permissions(info.context):
-            raise PermissionDenied()
+        instance = cls.get_instance(info, external_reference=external_reference, id=id)
 
-        node_id = data.get("id")
-        model_type = cls.get_type_for_model()
-        instance = cls.get_node_or_error(info, node_id, only_type=model_type)
-
-        if instance:
-            cls.clean_instance(info, instance)
-
+        cls.clean_instance(info, instance)
         db_id = instance.id
         instance.delete()
 
         # After the instance is deleted, set its ID to the original database's
         # ID so that the success response contains ID of the deleted object.
         instance.id = db_id
+        cls.post_save_action(info, instance, None)
         return cls.success_response(instance)
 
 
@@ -607,7 +870,7 @@ class BaseBulkMutation(BaseMutation):
         return cls._meta.object_type
 
     @classmethod
-    def clean_instance(cls, info, instance):
+    def clean_instance(cls, _info: ResolveInfo, _instance, /):
         """Perform additional logic.
 
         Override this method to raise custom validation error and prevent
@@ -615,17 +878,20 @@ class BaseBulkMutation(BaseMutation):
         """
 
     @classmethod
-    def bulk_action(cls, info, queryset, **kwargs):
+    def bulk_action(cls, _info: ResolveInfo, _queryset: QuerySet, /):
         """Implement action performed on queryset."""
         raise NotImplementedError
 
     @classmethod
-    def perform_mutation(cls, _root, info, ids, **data):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, ids, **data
+    ) -> Tuple[int, Optional[ValidationError]]:
         """Perform a mutation that deletes a list of model instances."""
-        clean_instance_ids, errors = [], {}
+        clean_instance_ids = []
+        errors_dict: Dict[str, List[ValidationError]] = {}
         # Allow to pass empty list for dummy mutation
         if not ids:
-            return 0, errors
+            return 0, None
         instance_model = cls._meta.model
         model_type = cls.get_type_for_model()
         if not model_type:
@@ -656,27 +922,38 @@ class BaseBulkMutation(BaseMutation):
             else:
                 instance_errors_msg = ". ".join(instance_errors)
                 ValidationError({node_id: instance_errors_msg}).update_error_dict(
-                    errors
+                    errors_dict
                 )
 
-        if errors:
-            errors = ValidationError(errors)
+        if errors_dict:
+            errors = ValidationError(errors_dict)
+        else:
+            errors = None
         count = len(clean_instance_ids)
         if count:
             qs = instance_model.objects.filter(pk__in=clean_instance_ids)
-            cls.bulk_action(info=info, queryset=qs, **data)
+            cls.bulk_action(info, qs, **data)
         return count, errors
 
     @classmethod
-    def mutate(cls, root, info, **data):
+    def mutate(cls, root, info: ResolveInfo, **data):
+        set_mutation_flag_in_context(info.context)
+        setup_context_user(info.context)
+
         if not cls.check_permissions(info.context):
-            raise PermissionDenied()
+            raise PermissionDenied(permissions=cls._meta.permissions)
+        manager = get_plugin_manager_promise(info.context).get()
+        result = manager.perform_mutation(
+            mutation_cls=cls, root=root, info=info, data=data
+        )
+        if result is not None:
+            return result
 
         count, errors = cls.perform_mutation(root, info, **data)
         if errors:
             return cls.handle_errors(errors, count=count)
 
-        return cls(errors=errors, count=count)
+        return cls(errors=[], count=count)
 
 
 class ModelBulkDeleteMutation(BaseBulkMutation):
@@ -684,7 +961,7 @@ class ModelBulkDeleteMutation(BaseBulkMutation):
         abstract = True
 
     @classmethod
-    def bulk_action(cls, info, queryset):
+    def bulk_action(cls, _info: ResolveInfo, queryset, /):
         queryset.delete()
 
 
@@ -704,14 +981,24 @@ class FileUpload(BaseMutation):
         )
         error_type_class = UploadError
         error_type_field = "upload_errors"
+        permissions = (
+            AuthorizationFilters.AUTHENTICATED_APP,
+            AuthorizationFilters.AUTHENTICATED_STAFF_USER,
+        )
 
     @classmethod
-    @staff_member_or_app_required
-    def perform_mutation(cls, _root, info, **data):
-        file_data = info.context.FILES.get(data["file"])
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, file
+    ):
+        file_data: UploadedFile = cast(UploadedFile, info.context.FILES[file])
 
         # add unique text fragment to the file name to prevent file overriding
-        file_name, format = os.path.splitext(file_data._name)
+        file_name, format = os.path.splitext(file_data.name or "")
+
+        # replace spaced with an underscore to prevent replacing the spaces with encoded
+        # values by storage
+        file_name = file_name.replace(" ", "_")
+
         hash = secrets.token_hex(nbytes=4)
         new_name = f"file_upload/{file_name}_{hash}{format}"
 

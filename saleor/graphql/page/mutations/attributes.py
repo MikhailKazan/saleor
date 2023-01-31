@@ -5,18 +5,19 @@ import graphene
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 
 from ....attribute import AttributeType, models
-from ....core.permissions import PagePermissions, PageTypePermissions
 from ....core.tracing import traced_atomic_transaction
 from ....page import models as page_models
 from ....page.error_codes import PageErrorCode
+from ....permission.enums import PagePermissions, PageTypePermissions
 from ...attribute.mutations import (
     BaseReorderAttributesMutation,
     BaseReorderAttributeValuesMutation,
 )
 from ...attribute.types import Attribute
+from ...core import ResolveInfo
 from ...core.inputs import ReorderInput
 from ...core.mutations import BaseMutation
-from ...core.types.common import PageError
+from ...core.types import NonNullList, PageError
 from ...core.utils.reordering import perform_reordering
 from ...page.types import Page, PageType
 from ...utils import resolve_global_ids_to_primary_keys
@@ -30,8 +31,8 @@ class PageAttributeAssign(BaseMutation):
             required=True,
             description="ID of the page type to assign the attributes into.",
         )
-        attribute_ids = graphene.List(
-            graphene.NonNull(graphene.ID),
+        attribute_ids = NonNullList(
+            graphene.ID,
             required=True,
             description="The IDs of the attributes to assign.",
         )
@@ -86,10 +87,10 @@ class PageAttributeAssign(BaseMutation):
             errors["attribute_ids"].append(error)
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        errors = defaultdict(list)
-        page_type_id: str = data["page_type_id"]
-        attribute_ids = data["attribute_ids"]
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, attribute_ids, page_type_id
+    ):
+        errors: defaultdict[str, List[ValidationError]] = defaultdict(list)
 
         # retrieve the requested page type
         page_type = cls.get_node_or_error(
@@ -122,8 +123,8 @@ class PageAttributeUnassign(BaseMutation):
                 "ID of the page type from which the attributes should be unassign."
             ),
         )
-        attribute_ids = graphene.List(
-            graphene.NonNull(graphene.ID),
+        attribute_ids = NonNullList(
+            graphene.ID,
             required=True,
             description="The IDs of the attributes to unassign.",
         )
@@ -135,7 +136,7 @@ class PageAttributeUnassign(BaseMutation):
         error_type_field = "page_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
         page_type_id = data["page_type_id"]
         attribute_ids = data["attribute_ids"]
 
@@ -159,8 +160,8 @@ class PageTypeReorderAttributes(BaseReorderAttributesMutation):
         page_type_id = graphene.Argument(
             graphene.ID, required=True, description="ID of a page type."
         )
-        moves = graphene.List(
-            graphene.NonNull(ReorderInput),
+        moves = NonNullList(
+            ReorderInput,
             required=True,
             description="The list of attribute reordering operations.",
         )
@@ -172,7 +173,7 @@ class PageTypeReorderAttributes(BaseReorderAttributesMutation):
         error_type_field = "page_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
         page_type_id = data["page_type_id"]
         pk = cls.get_global_id_or_error(page_type_id, only_type=PageType, field="pk")
 
@@ -223,14 +224,14 @@ class PageReorderAttributeValues(BaseReorderAttributeValuesMutation):
         attribute_id = graphene.Argument(
             graphene.ID, required=True, description="ID of an attribute."
         )
-        moves = graphene.List(
+        moves = NonNullList(
             ReorderInput,
             required=True,
             description="The list of reordering operations for given attribute values.",
         )
 
     @classmethod
-    def perform_mutation(cls, _root, _info, **data):
+    def perform_mutation(cls, _root, _info: ResolveInfo, /, **data):
         page_id = data["page_id"]
         page = cls.perform(page_id, "page", data, "pagevalueassignment", PageErrorCode)
         return PageReorderAttributeValues(page=page)

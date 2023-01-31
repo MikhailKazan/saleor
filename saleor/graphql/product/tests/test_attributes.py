@@ -268,7 +268,7 @@ def test_resolve_assigned_attribute_without_values(
 
 
 PRODUCT_ASSIGN_ATTR_QUERY = """
-    mutation assign($productTypeId: ID!, $operations: [ProductAttributeAssignInput]!) {
+    mutation assign($productTypeId: ID!, $operations: [ProductAttributeAssignInput!]!) {
       productAttributeAssign(productTypeId: $productTypeId, operations: $operations) {
         errors {
           field
@@ -280,9 +280,18 @@ PRODUCT_ASSIGN_ATTR_QUERY = """
           id
           productAttributes {
             id
+            visibleInStorefront
+            filterableInDashboard
+            filterableInStorefront
           }
           variantAttributes {
             id
+            visibleInStorefront
+            filterableInDashboard
+            filterableInStorefront
+            availableInGrid
+            valueRequired
+            storefrontSearchPosition
           }
         }
       }
@@ -579,7 +588,7 @@ def test_assign_attribute_to_product_type_having_already_that_attribute(
 
 PRODUCT_ASSIGN_ATTR_UPDATE_QUERY = """
     mutation assign(
-      $productTypeId: ID!, $operations: [ProductAttributeAssignmentUpdateInput]!
+      $productTypeId: ID!, $operations: [ProductAttributeAssignmentUpdateInput!]!
     ) {
       productAttributeAssignmentUpdate(
         productTypeId: $productTypeId, operations: $operations
@@ -1000,7 +1009,7 @@ def test_assign_attribute_to_product_type_multiple_errors_returned(
 
 PRODUCT_UNASSIGN_ATTR_QUERY = """
     mutation ProductUnassignAttribute(
-      $productTypeId: ID!, $attributeIds: [ID]!
+      $productTypeId: ID!, $attributeIds: [ID!]!
     ) {
       productAttributeUnassign(
           productTypeId: $productTypeId, attributeIds: $attributeIds
@@ -1078,10 +1087,6 @@ def test_unassign_attributes_from_product_type(
         == remaining_attribute_global_id
     )
 
-    product.refresh_from_db()
-    assert product.search_document
-    assert product_attr_value.name not in product.search_document
-
 
 def test_unassign_attributes_not_in_product_type(
     staff_api_client,
@@ -1116,9 +1121,7 @@ def test_unassign_attributes_not_in_product_type(
     assert len(content["productType"]["variantAttributes"]) == 0
 
 
-def test_retrieve_product_attributes_input_type(
-    staff_api_client, product, permission_manage_products, channel_USD
-):
+def test_retrieve_product_attributes_input_type(staff_api_client, product, channel_USD):
     query = """
         query ($channel: String){
           products(first: 10, channel: $channel) {
@@ -1137,9 +1140,7 @@ def test_retrieve_product_attributes_input_type(
 
     variables = {"channel": channel_USD.slug}
     found_products = get_graphql_content(
-        staff_api_client.post_graphql(
-            query, variables, permissions=[permission_manage_products]
-        )
+        staff_api_client.post_graphql(query, variables)
     )["data"]["products"]["edges"]
     assert len(found_products) == 1
 
@@ -1151,7 +1152,7 @@ def test_retrieve_product_attributes_input_type(
 ATTRIBUTES_RESORT_QUERY = """
     mutation ProductTypeReorderAttributes(
       $productTypeId: ID!
-      $moves: [ReorderInput]!
+      $moves: [ReorderInput!]!
       $type: ProductAttributeType!
     ) {
       productTypeReorderAttributes(
@@ -1322,7 +1323,7 @@ PRODUCT_REORDER_ATTRIBUTE_VALUES_MUTATION = """
     mutation ProductReorderAttributeValues(
       $productId: ID!
       $attributeId: ID!
-      $moves: [ReorderInput]!
+      $moves: [ReorderInput!]!
     ) {
       productReorderAttributeValues(
         productId: $productId
@@ -1556,7 +1557,7 @@ PRODUCT_VARIANT_REORDER_ATTRIBUTE_VALUES_MUTATION = """
     mutation ProductVariantReorderAttributeValues(
       $variantId: ID!
       $attributeId: ID!
-      $moves: [ReorderInput]!
+      $moves: [ReorderInput!]!
     ) {
       productVariantReorderAttributeValues(
         variantId: $variantId

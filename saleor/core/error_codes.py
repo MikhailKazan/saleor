@@ -16,6 +16,7 @@ class MetadataErrorCode(Enum):
     INVALID = "invalid"
     NOT_FOUND = "not_found"
     REQUIRED = "required"
+    NOT_UPDATED = "not_updated"
 
 
 class TranslationErrorCode(Enum):
@@ -26,4 +27,8 @@ class TranslationErrorCode(Enum):
 
 
 class UploadErrorCode(Enum):
+    GRAPHQL_ERROR = "graphql_error"
+
+
+class CoreErrorCode(Enum):
     GRAPHQL_ERROR = "graphql_error"

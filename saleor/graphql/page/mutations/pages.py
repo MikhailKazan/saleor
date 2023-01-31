@@ -1,21 +1,26 @@
 from collections import defaultdict
-from datetime import date
+from datetime import datetime
 from typing import TYPE_CHECKING, Dict, List
 
 import graphene
+import pytz
 from django.core.exceptions import ValidationError
 
 from ....attribute import AttributeInputType, AttributeType
 from ....attribute import models as attribute_models
-from ....core.permissions import PagePermissions, PageTypePermissions
 from ....core.tracing import traced_atomic_transaction
 from ....page import models
 from ....page.error_codes import PageErrorCode
+from ....permission.enums import PagePermissions, PageTypePermissions
 from ...attribute.types import AttributeValueInput
 from ...attribute.utils import AttributeAssignmentMixin
+from ...core import ResolveInfo
+from ...core.descriptions import ADDED_IN_33, DEPRECATED_IN_3X_INPUT, RICH_CONTENT
+from ...core.fields import JSONString
 from ...core.mutations import ModelDeleteMutation, ModelMutation
-from ...core.types.common import PageError, SeoInput
-from ...core.utils import clean_seo_fields, validate_slug_and_generate_if_needed
+from ...core.types import NonNullList, PageError, SeoInput
+from ...core.validators import clean_seo_fields, validate_slug_and_generate_if_needed
+from ...plugins.dataloaders import get_plugin_manager_promise
 from ...utils.validators import check_for_duplicates
 from ..types import Page, PageType
 
@@ -26,15 +31,19 @@ if TYPE_CHECKING:
 class PageInput(graphene.InputObjectType):
     slug = graphene.String(description="Page internal name.")
     title = graphene.String(description="Page title.")
-    content = graphene.JSONString(description="Page content in JSON format.")
-    attributes = graphene.List(
-        graphene.NonNull(AttributeValueInput), description="List of attributes."
-    )
+    content = JSONString(description="Page content." + RICH_CONTENT)
+    attributes = NonNullList(AttributeValueInput, description="List of attributes.")
     is_published = graphene.Boolean(
         description="Determines if page is visible in the storefront."
     )
     publication_date = graphene.String(
-        description="Publication date. ISO 8601 standard."
+        description=(
+            f"Publication date. ISO 8601 standard. {DEPRECATED_IN_3X_INPUT} "
+            "Use `publishedAt` field instead."
+        )
+    )
+    published_at = graphene.DateTime(
+        description="Publication date time. ISO 8601 standard." + ADDED_IN_33
     )
     seo = SeoInput(description="Search engine optimization fields.")
 
@@ -61,27 +70,42 @@ class PageCreate(ModelMutation):
 
     @classmethod
     def clean_attributes(cls, attributes: dict, page_type: models.PageType):
-        attributes_qs = page_type.page_attributes
+        attributes_qs = page_type.page_attributes.all()
         attributes = AttributeAssignmentMixin.clean_input(
             attributes, attributes_qs, is_page_attributes=True
         )
         return attributes
 
     @classmethod
-    def clean_input(cls, info, instance, data):
-        cleaned_input = super().clean_input(info, instance, data)
+    def clean_input(cls, info: ResolveInfo, instance, data, **kwargs):
+        cleaned_input = super().clean_input(info, instance, data, **kwargs)
         try:
             cleaned_input = validate_slug_and_generate_if_needed(
                 instance, "title", cleaned_input
             )
         except ValidationError as error:
-            error.code = PageErrorCode.REQUIRED
+            error.code = PageErrorCode.REQUIRED.value
             raise ValidationError({"slug": error})
 
+        if "publication_date" in cleaned_input and "published_at" in cleaned_input:
+            raise ValidationError(
+                {
+                    "publication_date": ValidationError(
+                        "Only one of argument: publicationDate or publishedAt "
+                        "must be specified.",
+                        code=PageErrorCode.INVALID.value,
+                    )
+                }
+            )
+
         is_published = cleaned_input.get("is_published")
-        publication_date = cleaned_input.get("publication_date")
+        publication_date = cleaned_input.get("published_at") or cleaned_input.get(
+            "publication_date"
+        )
         if is_published and not publication_date:
-            cleaned_input["publication_date"] = date.today()
+            cleaned_input["published_at"] = datetime.now(pytz.UTC)
+        elif "publication_date" in cleaned_input or "published_at" in cleaned_input:
+            cleaned_input["published_at"] = publication_date
 
         attributes = cleaned_input.get("attributes")
         page_type = (
@@ -100,18 +124,19 @@ class PageCreate(ModelMutation):
         return cleaned_input
 
     @classmethod
-    @traced_atomic_transaction()
-    def _save_m2m(cls, info, instance, cleaned_data):
-        super()._save_m2m(info, instance, cleaned_data)
+    def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
+        with traced_atomic_transaction():
+            super()._save_m2m(info, instance, cleaned_data)
 
-        attributes = cleaned_data.get("attributes")
-        if attributes:
-            AttributeAssignmentMixin.save(instance, attributes)
+            attributes = cleaned_data.get("attributes")
+            if attributes:
+                AttributeAssignmentMixin.save(instance, attributes)
 
     @classmethod
-    def save(cls, info, instance, cleaned_input):
+    def save(cls, info: ResolveInfo, instance, cleaned_input):
         super().save(info, instance, cleaned_input)
-        info.context.plugins.page_created(instance)
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.page_created, instance)
 
 
 class PageUpdate(PageCreate):
@@ -131,16 +156,17 @@ class PageUpdate(PageCreate):
 
     @classmethod
     def clean_attributes(cls, attributes: dict, page_type: models.PageType):
-        attributes_qs = page_type.page_attributes
+        attributes_qs = page_type.page_attributes.all()
         attributes = AttributeAssignmentMixin.clean_input(
             attributes, attributes_qs, creation=False, is_page_attributes=True
         )
         return attributes
 
     @classmethod
-    def save(cls, info, instance, cleaned_input):
+    def save(cls, info: ResolveInfo, instance, cleaned_input):
         super(PageCreate, cls).save(info, instance, cleaned_input)
-        info.context.plugins.page_updated(instance)
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.page_updated, instance)
 
 
 class PageDelete(ModelDeleteMutation):
@@ -156,12 +182,13 @@ class PageDelete(ModelDeleteMutation):
         error_type_field = "page_errors"
 
     @classmethod
-    @traced_atomic_transaction()
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
         page = cls.get_instance(info, **data)
-        cls.delete_assigned_attribute_values(page)
-        response = super().perform_mutation(_root, info, **data)
-        info.context.plugins.page_deleted(page)
+        manager = get_plugin_manager_promise(info.context).get()
+        with traced_atomic_transaction():
+            cls.delete_assigned_attribute_values(page)
+            response = super().perform_mutation(_root, info, **data)
+            cls.call_event(manager.page_deleted, page)
         return response
 
     @staticmethod
@@ -175,15 +202,15 @@ class PageDelete(ModelDeleteMutation):
 class PageTypeCreateInput(graphene.InputObjectType):
     name = graphene.String(description="Name of the page type.")
     slug = graphene.String(description="Page type slug.")
-    add_attributes = graphene.List(
-        graphene.NonNull(graphene.ID),
+    add_attributes = NonNullList(
+        graphene.ID,
         description="List of attribute IDs to be assigned to the page type.",
     )
 
 
 class PageTypeUpdateInput(PageTypeCreateInput):
-    remove_attributes = graphene.List(
-        graphene.NonNull(graphene.ID),
+    remove_attributes = NonNullList(
+        graphene.ID,
         description="List of attribute IDs to be assigned to the page type.",
     )
 
@@ -230,8 +257,8 @@ class PageTypeCreate(PageTypeMixin, ModelMutation):
         error_type_field = "page_errors"
 
     @classmethod
-    def clean_input(cls, info, instance, data):
-        cleaned_input = super().clean_input(info, instance, data)
+    def clean_input(cls, info: ResolveInfo, instance, data, **kwargs):
+        cleaned_input = super().clean_input(info, instance, data, **kwargs)
         errors = defaultdict(list)
         try:
             cleaned_input = validate_slug_and_generate_if_needed(
@@ -251,11 +278,16 @@ class PageTypeCreate(PageTypeMixin, ModelMutation):
         return cleaned_input
 
     @classmethod
-    def _save_m2m(cls, info, instance, cleaned_data):
+    def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
         super()._save_m2m(info, instance, cleaned_data)
         attributes = cleaned_data.get("add_attributes")
         if attributes is not None:
             instance.page_attributes.add(*attributes)
+
+    @classmethod
+    def post_save_action(cls, info: ResolveInfo, instance, cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.page_type_created, instance)
 
 
 class PageTypeUpdate(PageTypeMixin, ModelMutation):
@@ -274,7 +306,7 @@ class PageTypeUpdate(PageTypeMixin, ModelMutation):
         error_type_field = "page_errors"
 
     @classmethod
-    def clean_input(cls, info, instance, data):
+    def clean_input(cls, info: ResolveInfo, instance, data, **kwargs):
         errors = defaultdict(list)
         error = check_for_duplicates(
             data, "add_attributes", "remove_attributes", "attributes"
@@ -283,7 +315,7 @@ class PageTypeUpdate(PageTypeMixin, ModelMutation):
             error.code = PageErrorCode.DUPLICATED_INPUT_ITEM.value
             errors["attributes"].append(error)
 
-        cleaned_input = super().clean_input(info, instance, data)
+        cleaned_input = super().clean_input(info, instance, data, **kwargs)
         try:
             cleaned_input = validate_slug_and_generate_if_needed(
                 instance, "name", cleaned_input
@@ -304,7 +336,7 @@ class PageTypeUpdate(PageTypeMixin, ModelMutation):
         return cleaned_input
 
     @classmethod
-    def _save_m2m(cls, info, instance, cleaned_data):
+    def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
         super()._save_m2m(info, instance, cleaned_data)
         remove_attributes = cleaned_data.get("remove_attributes")
         add_attributes = cleaned_data.get("add_attributes")
@@ -312,6 +344,11 @@ class PageTypeUpdate(PageTypeMixin, ModelMutation):
             instance.page_attributes.remove(*remove_attributes)
         if add_attributes is not None:
             instance.page_attributes.add(*add_attributes)
+
+    @classmethod
+    def post_save_action(cls, info: ResolveInfo, instance, cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.page_type_updated, instance)
 
 
 class PageTypeDelete(ModelDeleteMutation):
@@ -327,14 +364,13 @@ class PageTypeDelete(ModelDeleteMutation):
         error_type_field = "page_errors"
 
     @classmethod
-    @traced_atomic_transaction()
-    def perform_mutation(cls, _root, info, **data):
-        node_id = data.get("id")
-        page_type_pk = cls.get_global_id_or_error(
-            node_id, only_type=PageType, field="pk"
-        )
-        cls.delete_assigned_attribute_values(page_type_pk)
-        return super().perform_mutation(_root, info, **data)
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, id: str
+    ):
+        page_type_pk = cls.get_global_id_or_error(id, only_type=PageType, field="pk")
+        with traced_atomic_transaction():
+            cls.delete_assigned_attribute_values(page_type_pk)
+            return super().perform_mutation(_root, info, id=id)
 
     @staticmethod
     def delete_assigned_attribute_values(instance_pk):
@@ -342,3 +378,8 @@ class PageTypeDelete(ModelDeleteMutation):
             attribute__input_type__in=AttributeInputType.TYPES_WITH_UNIQUE_VALUES,
             pageassignments__assignment__page_type_id=instance_pk,
         ).delete()
+
+    @classmethod
+    def post_save_action(cls, info: ResolveInfo, instance, cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.page_type_deleted, instance)

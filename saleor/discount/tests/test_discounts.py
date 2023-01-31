@@ -5,9 +5,6 @@ import pytest
 from django.utils import timezone
 from prices import Money, TaxedMoney
 
-from ...checkout.fetch import fetch_checkout_info, fetch_checkout_lines
-from ...checkout.utils import get_voucher_discount_for_checkout
-from ...plugins.manager import get_plugins_manager
 from ...product.models import Product, ProductVariant, ProductVariantChannelListing
 from .. import DiscountInfo, DiscountValueType, VoucherType
 from ..models import (
@@ -18,7 +15,6 @@ from ..models import (
     VoucherChannelListing,
     VoucherCustomer,
 )
-from ..templatetags.voucher import discount_as_negative
 from ..utils import (
     add_voucher_usage_by_customer,
     decrease_voucher_usage,
@@ -30,12 +26,7 @@ from ..utils import (
 )
 
 
-def test_valid_voucher_min_spent_amount_with_display_gross_prices(
-    channel_USD, site_settings
-):
-    site_settings.display_gross_prices = True
-    site_settings.save()
-
+def test_valid_voucher_min_spent_amount(channel_USD):
     voucher = Voucher.objects.create(
         code="unique",
         type=VoucherType.SHIPPING,
@@ -47,17 +38,12 @@ def test_valid_voucher_min_spent_amount_with_display_gross_prices(
         discount=Money(10, "USD"),
         min_spent=Money(7, "USD"),
     )
-    value = TaxedMoney(net=Money(5, "USD"), gross=Money(7, "USD"))
+    value = Money(7, "USD")
 
     voucher.validate_min_spent(value, channel_USD)
 
 
-def test_valid_voucher_min_spent_amount_without_display_gross_prices(
-    channel_USD, site_settings
-):
-    site_settings.display_gross_prices = False
-    site_settings.save()
-
+def test_valid_voucher_min_spent_amount_not_reached(channel_USD):
     voucher = Voucher.objects.create(
         code="unique",
         type=VoucherType.SHIPPING,
@@ -69,7 +55,7 @@ def test_valid_voucher_min_spent_amount_without_display_gross_prices(
         discount=Money(10, "USD"),
         min_spent=Money(7, "USD"),
     )
-    value = TaxedMoney(net=Money(5, "USD"), gross=Money(7, "USD"))
+    value = Money(5, "USD")
 
     with pytest.raises(NotApplicable):
         voucher.validate_min_spent(value, channel_USD)
@@ -368,57 +354,6 @@ def test_voucher_queryset_active_in_other_channel(voucher, channel_PLN):
     assert active_vouchers.count() == 0
 
 
-@pytest.mark.parametrize(
-    "prices, discount_value, discount_type, apply_once_per_order, expected_value",
-    [
-        ([10], 10, DiscountValueType.FIXED, True, 10),
-        ([5], 10, DiscountValueType.FIXED, True, 5),
-        ([5, 5], 10, DiscountValueType.FIXED, True, 5),
-        ([2, 3], 10, DiscountValueType.FIXED, True, 2),
-        ([10, 10], 5, DiscountValueType.FIXED, False, 10),
-        ([5, 2], 5, DiscountValueType.FIXED, False, 7),
-        ([10, 10, 10], 5, DiscountValueType.FIXED, False, 15),
-    ],
-)
-def test_specific_products_voucher_checkout_discount(
-    monkeypatch,
-    prices,
-    discount_value,
-    discount_type,
-    expected_value,
-    apply_once_per_order,
-    checkout_with_item,
-    channel_USD,
-):
-    discounts = []
-    monkeypatch.setattr(
-        "saleor.checkout.utils.get_prices_of_discounted_specific_product",
-        lambda manager, checkout_info, lines, voucher, channel: (
-            Money(price, "USD") for price in prices
-        ),
-    )
-    voucher = Voucher.objects.create(
-        code="unique",
-        type=VoucherType.SPECIFIC_PRODUCT,
-        discount_value_type=discount_type,
-        apply_once_per_order=apply_once_per_order,
-    )
-    VoucherChannelListing.objects.create(
-        voucher=voucher,
-        channel=channel_USD,
-        discount=Money(discount_value, channel_USD.currency_code),
-    )
-    checkout = checkout_with_item
-    manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
-    checkout_info = fetch_checkout_info(checkout, lines, discounts, manager)
-    manager = get_plugins_manager()
-    discount = get_voucher_discount_for_checkout(
-        manager, voucher, checkout_info, lines, checkout.shipping_address, discounts
-    )
-    assert discount == Money(expected_value, "USD")
-
-
 def test_sale_applies_to_correct_products(product_type, category, channel_USD):
     product = Product.objects.create(
         name="Test Product",
@@ -567,9 +502,8 @@ def test_validate_voucher(
         min_spent_amount=min_spent_amount,
     )
     total_price = Money(total, "USD")
-    price = TaxedMoney(gross=total_price, net=total_price)
     validate_voucher(
-        voucher, price, total_quantity, "test@example.com", channel_USD, None
+        voucher, total_price, total_quantity, "test@example.com", channel_USD, None
     )
 
 
@@ -662,11 +596,10 @@ def test_validate_voucher_not_applicable(
         min_spent_amount=min_spent_amount,
     )
     total_price = Money(total, "USD")
-    price = TaxedMoney(net=total_price, gross=total_price)
 
     with pytest.raises(NotApplicable):
         validate_voucher(
-            voucher, price, total_quantity, "test@example.com", channel_USD, None
+            voucher, total_price, total_quantity, "test@example.com", channel_USD, None
         )
 
 
@@ -680,7 +613,12 @@ def test_validate_voucher_not_applicable_once_per_customer(
     total_price = TaxedMoney(net=price, gross=price)
     with pytest.raises(NotApplicable):
         validate_voucher(
-            voucher, total_price, 0, customer_user.email, channel_USD, customer_user
+            voucher,
+            total_price,
+            0,
+            customer_user.email,
+            channel_USD,
+            customer_user,
         )
 
 
@@ -725,24 +663,6 @@ def test_sale_active(current_date, start_date, end_date, is_active, channel_USD)
     )
     sale_is_active = Sale.objects.active(date=current_date).exists()
     assert is_active == sale_is_active
-
-
-def test_discount_as_negative():
-    discount = Money(10, "USD")
-    result = discount_as_negative(discount)
-    assert result == "-$10.00"
-
-
-def test_discount_as_negative_for_zero_value():
-    discount = Money(0, "USD")
-    result = discount_as_negative(discount)
-    assert result == "$0.00"
-
-
-def test_discount_as_negative_for_html():
-    discount = Money(10, "USD")
-    result = discount_as_negative(discount, True)
-    assert result == '-<span class="currency">$</span>10.00'
 
 
 def test_get_fixed_sale_discount(sale):

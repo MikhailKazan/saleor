@@ -1,5 +1,5 @@
 from collections import Counter, defaultdict
-from typing import List
+from typing import DefaultDict, List
 
 import graphene
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
@@ -7,21 +7,22 @@ from django.db.models import Q
 
 from ....attribute import AttributeInputType, AttributeType
 from ....attribute import models as attribute_models
-from ....core.permissions import ProductPermissions, ProductTypePermissions
 from ....core.tracing import traced_atomic_transaction
+from ....permission.enums import ProductPermissions, ProductTypePermissions
 from ....product import models
 from ....product.error_codes import ProductErrorCode
-from ....product.search import update_products_search_document
+from ....product.search import update_products_search_vector
 from ...attribute.mutations import (
     BaseReorderAttributesMutation,
     BaseReorderAttributeValuesMutation,
 )
 from ...attribute.types import Attribute
 from ...channel import ChannelContext
+from ...core import ResolveInfo
 from ...core.descriptions import ADDED_IN_31
 from ...core.inputs import ReorderInput
 from ...core.mutations import BaseMutation
-from ...core.types.common import ProductError
+from ...core.types import NonNullList, ProductError
 from ...core.utils.reordering import perform_reordering
 from ...product.types import Product, ProductType, ProductVariant
 from ..enums import ProductAttributeType
@@ -35,8 +36,9 @@ class ProductAttributeAssignInput(graphene.InputObjectType):
     variant_selection = graphene.Boolean(
         required=False,
         description=(
-            f"{ADDED_IN_31} Whether attribute is allowed in variant selection. "
+            "Whether attribute is allowed in variant selection. "
             f"Allowed types are: {AttributeInputType.ALLOWED_IN_VARIANT_SELECTION}."
+            + ADDED_IN_31
         ),
     )
 
@@ -46,8 +48,9 @@ class ProductAttributeAssignmentUpdateInput(graphene.InputObjectType):
     variant_selection = graphene.Boolean(
         required=True,
         description=(
-            f"{ADDED_IN_31} Whether attribute is allowed in variant selection. "
+            "Whether attribute is allowed in variant selection. "
             f"Allowed types are: {AttributeInputType.ALLOWED_IN_VARIANT_SELECTION}."
+            + ADDED_IN_31
         ),
     )
 
@@ -79,7 +82,7 @@ class VariantAssignmentValidationMixin:
                     "variant selection. Supported types are: "
                     f"{AttributeInputType.ALLOWED_IN_VARIANT_SELECTION}."
                 ),
-                code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED,
+                code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED.value,
                 params={"attributes": invalid_attr_ids},
             )
             errors["operations"].append(error)
@@ -93,7 +96,7 @@ class ProductAttributeAssign(BaseMutation, VariantAssignmentValidationMixin):
             required=True,
             description="ID of the product type to assign the attributes into.",
         )
-        operations = graphene.List(
+        operations = NonNullList(
             ProductAttributeAssignInput,
             required=True,
             description="The operations to perform.",
@@ -106,7 +109,9 @@ class ProductAttributeAssign(BaseMutation, VariantAssignmentValidationMixin):
         permissions = (ProductTypePermissions.MANAGE_PRODUCT_TYPES_AND_ATTRIBUTES,)
 
     @classmethod
-    def get_operations(cls, info, operations: List[ProductAttributeAssignInput]):
+    def get_operations(
+        cls, info: ResolveInfo, operations: List[ProductAttributeAssignInput]
+    ):
         """Resolve all passed global ids into integer PKs of the Attribute type."""
         product_attrs_pks = []
         variant_attrs_pks = []
@@ -170,7 +175,7 @@ class ProductAttributeAssign(BaseMutation, VariantAssignmentValidationMixin):
             ]
             error = ValidationError(
                 (f"{msg} have already been assigned to this product type."),
-                code=ProductErrorCode.ATTRIBUTE_ALREADY_ASSIGNED,
+                code=ProductErrorCode.ATTRIBUTE_ALREADY_ASSIGNED.value,
                 params={"attributes": invalid_attr_ids},
             )
             errors["operations"].append(error)
@@ -186,7 +191,7 @@ class ProductAttributeAssign(BaseMutation, VariantAssignmentValidationMixin):
                 )
                 error = ValidationError(
                     msg,
-                    code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED,
+                    code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED.value,
                     params={"attributes": attr_pk},
                 )
                 errors["operations"].append(error)
@@ -204,7 +209,7 @@ class ProductAttributeAssign(BaseMutation, VariantAssignmentValidationMixin):
             ]
             error = ValidationError(
                 "Cannot assign variant only attributes.",
-                code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED,
+                code=ProductErrorCode.ATTRIBUTE_CANNOT_BE_ASSIGNED.value,
                 params={"attributes": restricted_attr_ids},
             )
             errors["operations"].append(error)
@@ -227,7 +232,7 @@ class ProductAttributeAssign(BaseMutation, VariantAssignmentValidationMixin):
             ]
             error = ValidationError(
                 "Attribute doesn't exist.",
-                code=ProductErrorCode.NOT_FOUND,
+                code=ProductErrorCode.NOT_FOUND.value,
                 params={"attributes": list(invalid_attrs)},
             )
             errors["operations"].append(error)
@@ -263,8 +268,7 @@ class ProductAttributeAssign(BaseMutation, VariantAssignmentValidationMixin):
                 )
 
     @classmethod
-    @traced_atomic_transaction()
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
         product_type_id: str = data["product_type_id"]
         operations: List[ProductAttributeAssignInput] = data["operations"]
         # Retrieve the requested product type
@@ -289,9 +293,10 @@ class ProductAttributeAssign(BaseMutation, VariantAssignmentValidationMixin):
         # Ensure the attribute are assignable
         cls.clean_operations(product_type, product_attrs_data, variant_attrs_data)
 
-        # Commit
-        cls.save_field_values(product_type, "AttributeProduct", product_attrs_data)
-        cls.save_field_values(product_type, "AttributeVariant", variant_attrs_data)
+        with traced_atomic_transaction():
+            # Commit
+            cls.save_field_values(product_type, "AttributeProduct", product_attrs_data)
+            cls.save_field_values(product_type, "AttributeVariant", variant_attrs_data)
 
         return cls(product_type=product_type)
 
@@ -306,7 +311,7 @@ class ProductAttributeUnassign(BaseMutation):
                 "ID of the product type from which the attributes should be unassigned."
             ),
         )
-        attribute_ids = graphene.List(
+        attribute_ids = NonNullList(
             graphene.ID,
             required=True,
             description="The IDs of the attributes to unassign.",
@@ -324,7 +329,7 @@ class ProductAttributeUnassign(BaseMutation):
         getattr(product_type, field).remove(*pks)
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
         product_type_id: str = data["product_type_id"]
         attribute_ids: List[str] = data["attribute_ids"]
         # Retrieve the requested product type
@@ -344,7 +349,7 @@ class ProductAttributeUnassign(BaseMutation):
         cls.save_field_values(product_type, "product_attributes", attribute_pks)
         cls.save_field_values(product_type, "variant_attributes", attribute_pks)
 
-        update_products_search_document(product_type.products.all())
+        update_products_search_vector(product_type.products.all())
 
         return cls(product_type=product_type)
 
@@ -357,7 +362,7 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
             required=True,
             description="ID of the product type to assign the attributes into.",
         )
-        operations = graphene.List(
+        operations = NonNullList(
             ProductAttributeAssignmentUpdateInput,
             required=True,
             description="The operations to perform.",
@@ -365,8 +370,8 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
 
     class Meta:
         description = (
-            f"{ADDED_IN_31} Update attributes assigned to product "
-            "variant for given product type."
+            "Update attributes assigned to product variant for given product type."
+            + ADDED_IN_31
         )
 
         error_type_class = ProductError
@@ -375,7 +380,7 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
 
     @classmethod
     def get_operations(
-        cls, info, operations: List[ProductAttributeAssignmentUpdateInput]
+        cls, info: ResolveInfo, operations: List[ProductAttributeAssignmentUpdateInput]
     ):
         variant_attrs_pks = []
         for operation in operations:
@@ -387,7 +392,7 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
         return variant_attrs_pks
 
     @classmethod
-    def check_attribute_assigment_exsistence(
+    def check_attribute_assignment_exsistence(
         cls, errors, product_type, variant_attrs_pks
     ):
         """Ensure the attributes are assigned to VariantAttributes."""
@@ -410,7 +415,7 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
             ]
             error = ValidationError(
                 "Attribute is not assigned to product type.",
-                code=ProductErrorCode.NOT_FOUND,
+                code=ProductErrorCode.NOT_FOUND.value,
                 params={
                     "attributes": invalid_attrs,
                 },
@@ -418,7 +423,7 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
             errors["operations"].append(error)
 
     @classmethod
-    def check_attribute_assigment_to_product_variant(
+    def check_attribute_assignment_to_product_variant(
         cls, errors, variant_attrs_pks, product_type
     ):
         assigned_attributes = attribute_models.AttributeVariant.objects.filter(
@@ -434,7 +439,7 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
             ]
             error = ValidationError(
                 "Attribute is not assigned to product variant.",
-                code=ProductErrorCode.NOT_FOUND,
+                code=ProductErrorCode.NOT_FOUND.value,
                 params={
                     "attributes": invalid_attrs,
                 },
@@ -452,14 +457,14 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
         if invalid_ids:
             error = ValidationError(
                 "Attribute ids should be unique within operations.",
-                code=ProductErrorCode.INVALID,
+                code=ProductErrorCode.INVALID.value,
                 params={"attributes": invalid_ids},
             )
             errors["operations"].append(error)
 
     @classmethod
     def clean_operations(cls, product_type, variant_attrs_data):
-        errors = defaultdict(list)
+        errors: DefaultDict[str, List[ValidationError]] = defaultdict(list)
         variant_attrs_pks = [pk for pk, _, in variant_attrs_data]
 
         cls.check_for_duplicates(errors, variant_attrs_pks)
@@ -476,15 +481,15 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
             ]
             error = ValidationError(
                 "Attribute doesn't exist.",
-                code=ProductErrorCode.NOT_FOUND,
+                code=ProductErrorCode.NOT_FOUND.value,
                 params={"attributes": list(invalid_attrs)},
             )
             errors["operations"].append(error)
 
-        cls.check_attribute_assigment_exsistence(
+        cls.check_attribute_assignment_exsistence(
             errors, product_type, variant_attrs_pks
         )
-        cls.check_attribute_assigment_to_product_variant(
+        cls.check_attribute_assignment_to_product_variant(
             errors, variant_attrs_pks, product_type
         )
         cls.check_allowed_types(errors, variant_attrs_data)
@@ -513,8 +518,7 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
         ).update(variant_selection=False)
 
     @classmethod
-    @traced_atomic_transaction()
-    def perform_mutation(cls, root, info, **data):
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
         product_type_id: str = data["product_type_id"]
         operations: List[ProductAttributeAssignmentUpdateInput] = data["operations"]
         # Retrieve the requested product type
@@ -538,7 +542,8 @@ class ProductAttributeAssignmentUpdate(BaseMutation, VariantAssignmentValidation
             )
 
         cls.clean_operations(product_type, variant_attrs_data)
-        cls.update_field_values(product_type, variant_attrs_data)
+        with traced_atomic_transaction():
+            cls.update_field_values(product_type, variant_attrs_data)
         return cls(product_type=product_type)
 
 
@@ -560,14 +565,16 @@ class ProductTypeReorderAttributes(BaseReorderAttributesMutation):
         type = ProductAttributeType(
             required=True, description="The attribute type to reorder."
         )
-        moves = graphene.List(
+        moves = NonNullList(
             ReorderInput,
             required=True,
             description="The list of attribute reordering operations.",
         )
 
     @classmethod
-    def perform_mutation(cls, _root, info, product_type_id, type, moves):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, _info: ResolveInfo, /, *, moves, product_type_id, type
+    ):
         pk = cls.get_global_id_or_error(
             product_type_id, only_type=ProductType, field="product_type_id"
         )
@@ -586,7 +593,7 @@ class ProductTypeReorderAttributes(BaseReorderAttributesMutation):
                 {
                     "product_type_id": ValidationError(
                         (f"Couldn't resolve to a product type: {product_type_id}"),
-                        code=ProductErrorCode.NOT_FOUND,
+                        code=ProductErrorCode.NOT_FOUND.value,
                     )
                 }
             )
@@ -623,14 +630,14 @@ class ProductReorderAttributeValues(BaseReorderAttributeValuesMutation):
         attribute_id = graphene.Argument(
             graphene.ID, required=True, description="ID of an attribute."
         )
-        moves = graphene.List(
+        moves = NonNullList(
             ReorderInput,
             required=True,
             description="The list of reordering operations for given attribute values.",
         )
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, _info: ResolveInfo, /, **data):
         product_id = data["product_id"]
         product = cls.perform(
             product_id, "product", data, "productvalueassignment", ProductErrorCode
@@ -679,14 +686,14 @@ class ProductVariantReorderAttributeValues(BaseReorderAttributeValuesMutation):
         attribute_id = graphene.Argument(
             graphene.ID, required=True, description="ID of an attribute."
         )
-        moves = graphene.List(
+        moves = NonNullList(
             ReorderInput,
             required=True,
             description="The list of reordering operations for given attribute values.",
         )
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(cls, _root, _info: ResolveInfo, /, **data):
         variant_id = data["variant_id"]
         variant = cls.perform(
             variant_id, "variant", data, "variantvalueassignment", ProductErrorCode

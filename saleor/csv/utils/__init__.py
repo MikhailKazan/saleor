@@ -8,7 +8,7 @@ class ProductExportFields:
             "description": "description_as_str",
             "category": "category__slug",
             "product type": "product_type__name",
-            "charge taxes": "charge_taxes",
+            "charge taxes": "",  # deprecated; remove in Saleor 4.0
             "product weight": "product_weight",
             "variant id": "variants__id",
             "variant sku": "variants__sku",
@@ -37,6 +37,9 @@ class ProductExportFields:
         "entity_type": "attributes__assignment__attribute__entity_type",
         "unit": "attributes__assignment__attribute__unit",
         "attribute_pk": "attributes__assignment__attribute__pk",
+        "reference_page": "attributes__values__reference_page",
+        "reference_product": "attributes__values__reference_product",
+        "reference_variant": "attributes__values__reference_variant",
     }
 
     PRODUCT_CHANNEL_LISTING_FIELDS = {
@@ -44,9 +47,10 @@ class ProductExportFields:
         "slug": "channel_listings__channel__slug",
         "product_currency_code": "channel_listings__currency",
         "published": "channel_listings__is_published",
-        "publication_date": "channel_listings__publication_date",
+        "publication_date": "channel_listings__published_at",
+        "published_at": "channel_listings__published_at",
         "searchable": "channel_listings__visible_in_listings",
-        "available for purchase": "channel_listings__available_for_purchase",
+        "available for purchase": "channel_listings__available_for_purchase_at",
     }
 
     WAREHOUSE_FIELDS = {
@@ -68,6 +72,9 @@ class ProductExportFields:
         "entity_type": "variants__attributes__assignment__attribute__entity_type",
         "unit": "variants__attributes__assignment__attribute__unit",
         "attribute_pk": "variants__attributes__assignment__attribute__pk",
+        "reference_page": "variants__attributes__values__reference_page",
+        "reference_product": "variants__attributes__values__reference_product",
+        "reference_variant": "variants__attributes__values__reference_variant",
     }
 
     VARIANT_CHANNEL_LISTING_FIELDS = {

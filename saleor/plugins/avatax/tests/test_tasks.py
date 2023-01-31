@@ -21,11 +21,10 @@ def test_api_post_request_task_sends_request(
 
     site_settings.company_address = address_usa
     site_settings.save()
-
     config = AvataxConfiguration(
         username_or_account="",
         password_or_license="",
-        use_sandbox=False,
+        use_sandbox=True,
         from_street_address="Tęczowa 7",
         from_city="WROCŁAW",
         from_postal_code="53-601",
@@ -57,7 +56,7 @@ def test_api_post_request_task_creates_order_event(
     config = AvataxConfiguration(
         username_or_account="",
         password_or_license="",
-        use_sandbox=False,
+        use_sandbox=True,
         from_street_address="Tęczowa 7",
         from_city="WROCŁAW",
         from_postal_code="53-601",
@@ -72,7 +71,7 @@ def test_api_post_request_task_creates_order_event(
         transaction_url, request_data, asdict(config), order_with_lines.id
     )
 
-    expected_event_msg = f"Order sent to Avatax. Order ID: {order_with_lines.token}"
+    expected_event_msg = f"Order sent to Avatax. Order ID: {order_with_lines.id}"
     assert order_with_lines.events.count() == 1
     event = order_with_lines.events.get()
     assert event.type == OrderEvents.EXTERNAL_SERVICE_NOTIFICATION

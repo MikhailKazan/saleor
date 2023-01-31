@@ -1,16 +1,22 @@
+import json
+from unittest import mock
+
 import graphene
 import pytest
+from django.utils.functional import SimpleLazyObject
 from django.utils.text import slugify
+from freezegun import freeze_time
 
 from .....attribute.error_codes import AttributeErrorCode
 from .....attribute.utils import associate_attribute_values_to_instance
+from .....core.utils.json_serializer import CustomJsonEncoder
+from .....webhook.event_types import WebhookEventAsyncType
+from .....webhook.payloads import generate_meta, generate_requestor
 from ....tests.utils import get_graphql_content
 
 UPDATE_ATTRIBUTE_VALUE_MUTATION = """
-mutation AttributeValueUpdate(
-        $id: ID!, $input: AttributeValueUpdateInput!) {
-    attributeValueUpdate(
-    id: $id, input: $input) {
+mutation AttributeValueUpdate($id: ID!, $input: AttributeValueUpdateInput!) {
+    attributeValueUpdate(id: $id, input: $input) {
         errors {
             field
             message
@@ -20,6 +26,7 @@ mutation AttributeValueUpdate(
             name
             slug
             value
+            externalReference
             file {
                 url
                 contentType
@@ -49,7 +56,14 @@ def test_update_attribute_value(
     value = pink_attribute_value
     node_id = graphene.Node.to_global_id("AttributeValue", value.id)
     name = "Crimson name"
-    variables = {"input": {"name": name}, "id": node_id}
+    external_reference = "test-ext-ref"
+    variables = {
+        "id": node_id,
+        "input": {
+            "name": name,
+            "externalReference": external_reference,
+        },
+    }
 
     # when
     response = staff_api_client.post_graphql(
@@ -62,9 +76,114 @@ def test_update_attribute_value(
     value.refresh_from_db()
     assert data["attributeValue"]["name"] == name == value.name
     assert data["attributeValue"]["slug"] == slugify(name)
+    assert (
+        data["attributeValue"]["externalReference"]
+        == external_reference
+        == value.external_reference
+    )
     assert name in [
         value["node"]["name"] for value in data["attribute"]["choices"]["edges"]
     ]
+
+
+def test_update_attribute_value_update_search_index_dirty_in_product(
+    staff_api_client,
+    product,
+    permission_manage_product_types_and_attributes,
+):
+    # given
+    query = UPDATE_ATTRIBUTE_VALUE_MUTATION
+    value = product.attributes.all()[0].values.first()
+    node_id = graphene.Node.to_global_id("AttributeValue", value.id)
+    name = "Crimson name"
+    variables = {"input": {"name": name}, "id": node_id}
+
+    # when
+    staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_product_types_and_attributes]
+    )
+    product.refresh_from_db(fields=["search_index_dirty"])
+
+    # then
+    assert product.search_index_dirty is True
+
+
+@freeze_time("2022-05-12 12:00:00")
+@mock.patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
+@mock.patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
+def test_update_attribute_value_trigger_webhooks(
+    mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
+    staff_api_client,
+    pink_attribute_value,
+    permission_manage_product_types_and_attributes,
+    settings,
+):
+    # given
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
+    settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
+
+    value = pink_attribute_value
+    node_id = graphene.Node.to_global_id("AttributeValue", value.id)
+    name = "Crimson name"
+    variables = {"input": {"name": name}, "id": node_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        UPDATE_ATTRIBUTE_VALUE_MUTATION,
+        variables,
+        permissions=[permission_manage_product_types_and_attributes],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["attributeValueUpdate"]
+    value.refresh_from_db()
+    attribute = value.attribute
+    meta = generate_meta(
+        requestor_data=generate_requestor(
+            SimpleLazyObject(lambda: staff_api_client.user)
+        )
+    )
+
+    attribute_updated_call = mock.call(
+        json.dumps(
+            {
+                "id": graphene.Node.to_global_id("Attribute", attribute.id),
+                "name": attribute.name,
+                "slug": attribute.slug,
+                "meta": meta,
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.ATTRIBUTE_UPDATED,
+        [any_webhook],
+        attribute,
+        SimpleLazyObject(lambda: staff_api_client.user),
+    )
+
+    attribute_value_created_call = mock.call(
+        json.dumps(
+            {
+                "id": graphene.Node.to_global_id("AttributeValue", value.id),
+                "name": value.name,
+                "slug": value.slug,
+                "value": value.value,
+                "meta": meta,
+            },
+            cls=CustomJsonEncoder,
+        ),
+        WebhookEventAsyncType.ATTRIBUTE_VALUE_UPDATED,
+        [any_webhook],
+        value,
+        SimpleLazyObject(lambda: staff_api_client.user),
+    )
+
+    # then
+    assert not data["errors"]
+    assert data["attributeValue"]["name"] == name == value.name
+    assert len(mocked_webhook_trigger.call_args_list) == 2
+    assert attribute_updated_call in mocked_webhook_trigger.call_args_list
+    assert attribute_value_created_call in mocked_webhook_trigger.call_args_list
 
 
 def test_update_attribute_value_name_not_unique(
@@ -90,6 +209,40 @@ def test_update_attribute_value_name_not_unique(
     data = content["data"]["attributeValueUpdate"]
     assert not data["errors"]
     assert data["attributeValue"]["slug"] == "pink-2"
+
+
+def test_update_attribute_value_the_same_name_as_different_attribute_value(
+    staff_api_client,
+    size_attribute,
+    color_attribute,
+    permission_manage_product_types_and_attributes,
+):
+    """Ensure the attribute value with the same slug as value of different attribute
+    can be set."""
+    # given
+    query = UPDATE_ATTRIBUTE_VALUE_MUTATION
+
+    value = size_attribute.values.first()
+    based_value = color_attribute.values.first()
+
+    node_id = graphene.Node.to_global_id("AttributeValue", value.id)
+    name = based_value.name
+    variables = {"input": {"name": name}, "id": node_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_product_types_and_attributes]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["attributeValueUpdate"]
+    value.refresh_from_db()
+    assert data["attributeValue"]["name"] == name == value.name
+    assert data["attributeValue"]["slug"] == based_value.slug
+    assert name in [
+        value["node"]["name"] for value in data["attribute"]["choices"]["edges"]
+    ]
 
 
 def test_update_attribute_value_product_search_document_updated(
@@ -127,9 +280,6 @@ def test_update_attribute_value_product_search_document_updated(
         value["node"]["name"] for value in data["attribute"]["choices"]["edges"]
     ]
 
-    product.refresh_from_db()
-    assert name.lower() in product.search_document
-
 
 def test_update_attribute_value_product_search_document_updated_variant_attribute(
     staff_api_client,
@@ -166,9 +316,6 @@ def test_update_attribute_value_product_search_document_updated_variant_attribut
     assert name in [
         value["node"]["name"] for value in data["attribute"]["choices"]["edges"]
     ]
-
-    product.refresh_from_db()
-    assert name.lower() in product.search_document
 
 
 def test_update_swatch_attribute_value(
@@ -299,3 +446,172 @@ def test_update_attribute_value_invalid_input_data(
     assert len(data["errors"]) == 1
     assert data["errors"][0]["code"] == AttributeErrorCode.INVALID.name
     assert data["errors"][0]["field"] == field
+
+
+def test_update_attribute_value_swatch_attr_value(
+    staff_api_client,
+    swatch_attribute,
+    permission_manage_product_types_and_attributes,
+):
+    # given
+    query = UPDATE_ATTRIBUTE_VALUE_MUTATION
+    value = swatch_attribute.values.first()
+    node_id = graphene.Node.to_global_id("AttributeValue", value.id)
+    new_value = "#FFFFF"
+    variables = {"input": {"value": new_value}, "id": node_id}
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_product_types_and_attributes]
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["attributeValueUpdate"]
+    value.refresh_from_db()
+    assert data["attributeValue"]["name"] == value.name
+    assert data["attributeValue"]["slug"] == value.slug
+    assert data["attributeValue"]["value"] == new_value
+
+
+UPDATE_ATTRIBUTE_VALUE_BY_EXTERNAL_REFERENCE_MUTATION = """
+mutation AttributeValueUpdate(
+        $id: ID, $externalReference: String, $input: AttributeValueUpdateInput!
+) {
+    attributeValueUpdate(
+        id: $id, externalReference: $externalReference, input: $input
+    ) {
+        errors {
+            field
+            message
+            code
+        }
+        attributeValue {
+            name
+            id
+            externalReference
+        }
+    }
+}
+"""
+
+
+def test_update_attribute_value_by_external_reference(
+    staff_api_client,
+    pink_attribute_value,
+    permission_manage_product_types_and_attributes,
+):
+    # given
+    query = UPDATE_ATTRIBUTE_VALUE_BY_EXTERNAL_REFERENCE_MUTATION
+    value = pink_attribute_value
+    new_name = "updated name"
+    ext_ref = "test-ext-ref"
+    value.external_reference = ext_ref
+    value.save(update_fields=["external_reference"])
+
+    variables = {
+        "input": {"name": new_name},
+        "externalReference": ext_ref,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_product_types_and_attributes]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    value.refresh_from_db()
+    data = content["data"]["attributeValueUpdate"]
+    assert not data["errors"]
+    assert data["attributeValue"]["name"] == new_name == value.name
+    assert data["attributeValue"]["id"] == graphene.Node.to_global_id(
+        "AttributeValue", value.id
+    )
+    assert data["attributeValue"]["externalReference"] == ext_ref
+
+
+def test_update_attribute_value_by_both_id_and_external_reference(
+    staff_api_client,
+    pink_attribute_value,
+    permission_manage_product_types_and_attributes,
+):
+    # given
+    query = UPDATE_ATTRIBUTE_VALUE_BY_EXTERNAL_REFERENCE_MUTATION
+    variables = {"input": {}, "externalReference": "whatever", "id": "whatever"}
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_product_types_and_attributes]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["attributeValueUpdate"]
+    assert not data["attributeValue"]
+    assert (
+        data["errors"][0]["message"]
+        == "Argument 'id' cannot be combined with 'external_reference'"
+    )
+
+
+def test_update_attribute_value_by_external_reference_not_existing(
+    staff_api_client,
+    pink_attribute_value,
+    permission_manage_product_types_and_attributes,
+):
+    # given
+    query = UPDATE_ATTRIBUTE_VALUE_BY_EXTERNAL_REFERENCE_MUTATION
+    ext_ref = "non-existing-ext-ref"
+    variables = {
+        "input": {},
+        "externalReference": ext_ref,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_product_types_and_attributes]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["attributeValueUpdate"]
+    assert not data["attributeValue"]
+    assert data["errors"][0]["message"] == f"Couldn't resolve to a node: {ext_ref}"
+    assert data["errors"][0]["field"] == "externalReference"
+
+
+def test_update_attribute_value_with_non_unique_external_reference(
+    staff_api_client,
+    color_attribute,
+    numeric_attribute,
+    permission_manage_product_types_and_attributes,
+):
+    # given
+    query = UPDATE_ATTRIBUTE_VALUE_BY_EXTERNAL_REFERENCE_MUTATION
+    value_1 = color_attribute.values.first()
+    ext_ref = "test-ext-ref"
+    value_1.external_reference = ext_ref
+    value_1.save(update_fields=["external_reference"])
+    value_2 = numeric_attribute.values.first()
+    value_2_id = graphene.Node.to_global_id("AttributeValue", value_2.id)
+
+    variables = {
+        "input": {"externalReference": ext_ref},
+        "id": value_2_id,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_product_types_and_attributes]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    error = content["data"]["attributeValueUpdate"]["errors"][0]
+    assert error["field"] == "externalReference"
+    assert error["code"] == AttributeErrorCode.UNIQUE.name
+    assert (
+        error["message"]
+        == "Attribute value with this External reference already exists."
+    )

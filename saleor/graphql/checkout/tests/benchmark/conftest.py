@@ -2,6 +2,7 @@ import pytest
 
 from .....checkout import calculations
 from .....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
+from .....checkout.models import CheckoutLine
 from .....checkout.utils import add_variant_to_checkout, add_voucher_to_checkout
 from .....payment import ChargeStatus, TransactionKind
 from .....payment.models import Payment
@@ -41,17 +42,24 @@ def checkout_with_variants(
 
 
 @pytest.fixture
-def checkout_with_variants_for_cc(
-    checkout, stocks_for_cc, product_variant_list, product_with_two_variants
-):
-    checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
-
-    add_variant_to_checkout(checkout_info, product_variant_list[0], 3)
-    add_variant_to_checkout(checkout_info, product_variant_list[1], 10)
-    add_variant_to_checkout(checkout_info, product_with_two_variants.variants.last(), 5)
-
-    checkout.save()
-    return checkout
+def checkout_with_variants_for_cc(checkout_for_cc, stocks_for_cc, product_variant_list):
+    CheckoutLine.objects.bulk_create(
+        [
+            CheckoutLine(
+                checkout=checkout_for_cc,
+                variant=product_variant_list[0],
+                quantity=1,
+                currency="USD",
+            ),
+            CheckoutLine(
+                checkout=checkout_for_cc,
+                variant=product_variant_list[1],
+                quantity=1,
+                currency="USD",
+            ),
+        ]
+    )
+    return checkout_for_cc
 
 
 @pytest.fixture()
@@ -120,7 +128,7 @@ def checkout_with_billing_address_for_cc(checkout_with_delivery_method_for_cc, a
 def checkout_with_voucher(checkout_with_billing_address, voucher):
     checkout = checkout_with_billing_address
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     add_voucher_to_checkout(manager, checkout_info, lines, voucher)
     return checkout
@@ -130,7 +138,7 @@ def checkout_with_voucher(checkout_with_billing_address, voucher):
 def checkout_with_charged_payment(checkout_with_voucher):
     checkout = checkout_with_voucher
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout_with_voucher, lines, [], manager)
     manager = get_plugins_manager()
     taxed_total = calculations.checkout_total(
@@ -174,7 +182,7 @@ def checkout_with_digital_line_with_charged_payment(
     checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
     add_variant_to_checkout(checkout_info, variant, 1)
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     taxed_total = calculations.checkout_total(
         manager=manager,
         checkout_info=checkout_info,
@@ -206,7 +214,7 @@ def checkout_with_digital_line_with_charged_payment(
 def checkout_with_charged_payment_for_cc(checkout_with_billing_address_for_cc):
     checkout = checkout_with_billing_address_for_cc
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     manager = get_plugins_manager()
     taxed_total = calculations.checkout_total(
@@ -245,12 +253,12 @@ def checkout_preorder_with_charged_payment(
 ):
     checkout = checkout_with_billing_address
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     add_variant_to_checkout(checkout_info, preorder_variant_channel_threshold, 1)
     add_variant_to_checkout(checkout_info, preorder_variant_global_threshold, 1)
 
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     manager = get_plugins_manager()
     taxed_total = calculations.checkout_total(
         manager=manager,

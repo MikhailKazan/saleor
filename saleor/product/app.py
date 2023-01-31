@@ -25,12 +25,12 @@ class ProductAppConfig(AppConfig):
             dispatch_uid="delete_collection_background",
         )
         post_delete.connect(
-            delete_digital_content_file,
-            sender=DigitalContent,
-            dispatch_uid="delete_digital_content_file",
-        )
-        post_delete.connect(
             delete_product_media_image,
             sender=ProductMedia,
             dispatch_uid="delete_product_media_image",
+        )
+        post_delete.connect(
+            delete_digital_content_file,
+            sender=DigitalContent,
+            dispatch_uid="delete_digital_content_file",
         )

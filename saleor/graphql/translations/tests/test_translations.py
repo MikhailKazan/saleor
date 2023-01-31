@@ -3,9 +3,11 @@ from unittest.mock import patch
 
 import graphene
 import pytest
-from django.contrib.auth.models import Permission
+from django.utils.functional import SimpleLazyObject
 from freezegun import freeze_time
 
+from ....attribute.utils import associate_attribute_values_to_instance
+from ....permission.models import Permission
 from ....tests.utils import dummy_editorjs
 from ....webhook.event_types import WebhookEventAsyncType
 from ....webhook.payloads import generate_translation_payload
@@ -828,14 +830,18 @@ PRODUCT_TRANSLATE_MUTATION = """
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_product_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     product,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     product_id = graphene.Node.to_global_id("Product", product.id)
@@ -852,7 +858,11 @@ def test_product_create_translation(
     translation = product.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -947,15 +957,42 @@ def test_product_create_translation_validates_name_length(
     ]
 
 
+def test_product_create_translation_by_invalid_translatable_content_id(
+    staff_api_client, product, permission_manage_translations
+):
+    translatable_content_id = (
+        "UHJvZHVjdFRyYW5zbGF0YWJsZUNvbnRlbnQ6NDkxMyd8fERCTVN"
+        "fUElQRS5SRUNFSVZFX01FU1NBR0UoQ0hSKDk4KXx8Q0hSKDk4KXx8Q"
+        "0hSKDk4KSwxNSl8fA=="
+    )
+
+    # String decodes to
+    # ProductTranslatableContent:4913'||
+    # DBMS_PIPE.RECEIVE_MESSAGE(CHR(98)||CHR(98)||CHR(98),15)||
+    response = staff_api_client.post_graphql(
+        PRODUCT_TRANSLATE_MUTATION,
+        {"productId": translatable_content_id, "input": {"name": "Produkt PL"}},
+        permissions=[permission_manage_translations],
+    )
+    data = get_graphql_content(response)["data"]["productTranslate"]
+    errors = data["errors"][0]
+    assert errors["code"] == "INVALID"
+    assert errors["field"] == "id"
+
+
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_product_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     product,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = product.translations.create(language_code="pl", name="Produkt")
@@ -974,7 +1011,11 @@ def test_product_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1003,15 +1044,19 @@ mutation productVariantTranslate(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_product_variant_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     variant,
     channel_USD,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     product_variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
@@ -1028,7 +1073,11 @@ def test_product_variant_create_translation(
     translation = variant.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1052,14 +1101,18 @@ def test_product_variant_create_translation_by_translatable_content_id(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_product_variant_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     variant,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = variant.translations.create(language_code="pl", name="Wariant")
@@ -1078,7 +1131,11 @@ def test_product_variant_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1133,14 +1190,18 @@ mutation collectionTranslate($collectionId: ID!, $input: TranslationInput!) {
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_collection_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     published_collection,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     collection_id = graphene.Node.to_global_id("Collection", published_collection.id)
@@ -1157,7 +1218,11 @@ def test_collection_create_translation(
     translation = published_collection.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1217,14 +1282,18 @@ def test_collection_create_translation_for_description_name_as_null(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_collection_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     published_collection,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = published_collection.translations.create(
@@ -1245,7 +1314,11 @@ def test_collection_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1288,14 +1361,18 @@ mutation categoryTranslate($categoryId: ID!, $input: TranslationInput!) {
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_category_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     category,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     category_id = graphene.Node.to_global_id("Category", category.id)
@@ -1312,7 +1389,11 @@ def test_category_create_translation(
     translation = category.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1372,14 +1453,18 @@ def test_category_create_translation_for_description_name_as_null(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_category_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     category,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = category.translations.create(language_code="pl", name="Kategoria")
@@ -1398,7 +1483,11 @@ def test_category_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1421,14 +1510,18 @@ VOUCHER_TRANSLATE_MUTATION = """
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_voucher_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     voucher,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     voucher_id = graphene.Node.to_global_id("Voucher", voucher.id)
@@ -1445,7 +1538,11 @@ def test_voucher_create_translation(
     translation = voucher.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1468,14 +1565,18 @@ def test_voucher_create_translation_by_translatable_content_id(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_voucher_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     voucher,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     translation = voucher.translations.create(language_code="pl", name="Kategoria")
 
@@ -1493,7 +1594,11 @@ def test_voucher_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1516,14 +1621,18 @@ SALE_TRANSLATION_MUTATION = """
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_sale_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     sale,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     sale_id = graphene.Node.to_global_id("Sale", sale.id)
@@ -1540,7 +1649,11 @@ def test_sale_create_translation(
     translation = sale.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1563,14 +1676,18 @@ def test_sale_create_translation_by_translatable_content_id(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_sale_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     sale,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = sale.translations.create(language_code="pl", name="Sale")
@@ -1589,7 +1706,11 @@ def test_sale_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1613,14 +1734,18 @@ mutation pageTranslate($pageId: ID!, $input: PageTranslationInput!) {
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_page_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     page,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     page_id = graphene.Node.to_global_id("Page", page.id)
@@ -1637,7 +1762,11 @@ def test_page_create_translation(
     translation = page.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1694,14 +1823,18 @@ def test_page_create_translation_by_translatable_content_id(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_page_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     page,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     translation = page.translations.create(language_code="pl", title="Strona")
 
@@ -1719,7 +1852,11 @@ def test_page_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1744,14 +1881,18 @@ ATTRIBUTE_TRANSLATE_MUTATION = """
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_attribute_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     color_attribute,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     attribute_id = graphene.Node.to_global_id("Attribute", color_attribute.id)
@@ -1768,7 +1909,11 @@ def test_attribute_create_translation(
     translation = color_attribute.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -1791,14 +1936,18 @@ def test_attribute_create_translation_by_translatable_content_id(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_attribute_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     color_attribute,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = color_attribute.translations.create(language_code="pl", name="Kolor")
@@ -1817,20 +1966,29 @@ def test_attribute_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
 ATTRIBUTE_VALUE_TRANSLATE_MUTATION = """
-    mutation attributeValueTranslate($attributeValueId: ID!, $name: String) {
+    mutation attributeValueTranslate(
+        $attributeValueId: ID!,
+        $input: AttributeValueTranslationInput!
+    ) {
         attributeValueTranslate(
             id: $attributeValueId,
             languageCode: PL,
-            input: { name: $name }
+            input: $input
         ) {
             attributeValue {
                 translation(languageCode: PL) {
                     name
+                    richText
+                    plainText
                     language {
                         code
                     }
@@ -1842,14 +2000,18 @@ ATTRIBUTE_VALUE_TRANSLATE_MUTATION = """
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_attribute_value_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     pink_attribute_value,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     attribute_value_id = graphene.Node.to_global_id(
@@ -1857,7 +2019,7 @@ def test_attribute_value_create_translation(
     )
     response = staff_api_client.post_graphql(
         ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
-        {"attributeValueId": attribute_value_id, "name": "Róż PL"},
+        {"attributeValueId": attribute_value_id, "input": {"name": "Róż PL"}},
         permissions=[permission_manage_translations],
     )
     data = get_graphql_content(response)["data"]["attributeValueTranslate"]
@@ -1868,8 +2030,79 @@ def test_attribute_value_create_translation(
     translation = pink_attribute_value.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
+
+
+def test_rich_text_attribute_value_create_translation(
+    staff_api_client,
+    product_with_rich_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    assigned_attribute = product_with_rich_text_attribute[0].attributes.first()
+    attribute_value = assigned_attribute.attribute.values.first()
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_base_text = "Nowy Opis"
+    expected_rich_text = json.dumps(dummy_editorjs(expected_base_text))
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"richText": expected_rich_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == expected_base_text
+    assert data["attributeValue"]["translation"]["richText"] == expected_rich_text
+
+
+def test_plain_text_attribute_value_create_translation(
+    staff_api_client,
+    variant,
+    plain_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    product_type = variant.product.product_type
+    product_type.variant_attributes.set([plain_text_attribute])
+
+    attribute_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        variant, plain_text_attribute, attribute_value
+    )
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_text = "Nowy Opis"
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"plainText": expected_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == expected_text
+    assert data["attributeValue"]["translation"]["plainText"] == expected_text
 
 
 def test_attribute_value_create_translation_by_translatable_content_id(
@@ -1880,7 +2113,7 @@ def test_attribute_value_create_translation_by_translatable_content_id(
     )
     response = staff_api_client.post_graphql(
         ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
-        {"attributeValueId": translatable_content_id, "name": "Róż PL"},
+        {"attributeValueId": translatable_content_id, "input": {"name": "Róż PL"}},
         permissions=[permission_manage_translations],
     )
     data = get_graphql_content(response)["data"]["attributeValueTranslate"]
@@ -1889,14 +2122,18 @@ def test_attribute_value_create_translation_by_translatable_content_id(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_attribute_value_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     pink_attribute_value,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = pink_attribute_value.translations.create(
@@ -1908,7 +2145,7 @@ def test_attribute_value_update_translation(
     )
     response = staff_api_client.post_graphql(
         ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
-        {"attributeValueId": attribute_value_id, "name": "Róż PL"},
+        {"attributeValueId": attribute_value_id, "input": {"name": "Róż PL"}},
         permissions=[permission_manage_translations],
     )
     data = get_graphql_content(response)["data"]["attributeValueTranslate"]
@@ -1919,8 +2156,393 @@ def test_attribute_value_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
+
+
+def test_rich_text_attribute_value_update_translation_only_rich_text(
+    staff_api_client,
+    product_with_rich_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    base_text = "Base Text"
+    rich_text = dummy_editorjs(base_text)
+    assigned_attribute = product_with_rich_text_attribute[0].attributes.first()
+    attribute_value = assigned_attribute.attribute.values.first()
+    attribute_value.translations.create(
+        language_code="pl", name=base_text, rich_text=rich_text
+    )
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_base_text = "Nowy Opis"
+    expected_rich_text = json.dumps(dummy_editorjs(expected_base_text))
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"richText": expected_rich_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == expected_base_text
+    assert data["attributeValue"]["translation"]["richText"] == expected_rich_text
+
+
+def test_rich_text_attribute_value_update_translation_only_rich_text_long_text(
+    staff_api_client,
+    product_with_rich_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    base_text = "Base Text"
+    rich_text = dummy_editorjs(base_text)
+    assigned_attribute = product_with_rich_text_attribute[0].attributes.first()
+    attribute_value = assigned_attribute.attribute.values.first()
+    attribute_value.translations.create(
+        language_code="pl", name=base_text, rich_text=rich_text
+    )
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_base_text = "Nowy Opis. " * 100
+    expected_rich_text = json.dumps(dummy_editorjs(expected_base_text))
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"richText": expected_rich_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert (
+        data["attributeValue"]["translation"]["name"] == expected_base_text[:99] + "…"
+    )
+    assert data["attributeValue"]["translation"]["richText"] == expected_rich_text
+
+
+def test_rich_text_attribute_value_update_translation_only_rich_text_name_set_manually(
+    staff_api_client,
+    product_with_rich_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    base_text = "Base Text"
+    rich_text = dummy_editorjs(base_text)
+    assigned_attribute = product_with_rich_text_attribute[0].attributes.first()
+    attribute_value = assigned_attribute.attribute.values.first()
+    attribute_value.translations.create(
+        language_code="pl", name=base_text, rich_text=rich_text
+    )
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_name = "Moja nazwa attrybutu"
+    expected_base_text = "Nowy Opis"
+    expected_rich_text = json.dumps(dummy_editorjs(expected_base_text))
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"name": expected_name, "richText": expected_rich_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == expected_name
+    assert data["attributeValue"]["translation"]["richText"] == expected_rich_text
+
+
+def test_rich_text_attribute_value_update_translation_only_rich_text_empty_name(
+    staff_api_client,
+    product_with_rich_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    base_text = "Base Text"
+    rich_text = dummy_editorjs(base_text)
+    assigned_attribute = product_with_rich_text_attribute[0].attributes.first()
+    attribute_value = assigned_attribute.attribute.values.first()
+    attribute_value.translations.create(
+        language_code="pl", name=base_text, rich_text=rich_text
+    )
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_base_text = "Nowy Opis"
+    expected_rich_text = json.dumps(dummy_editorjs(expected_base_text))
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"name": "", "richText": expected_rich_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == ""
+    assert data["attributeValue"]["translation"]["richText"] == expected_rich_text
+
+
+def test_rich_text_attribute_value_update_translation_only_rich_text_name_null(
+    staff_api_client,
+    product_with_rich_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    base_text = "Base Text"
+    rich_text = dummy_editorjs(base_text)
+    assigned_attribute = product_with_rich_text_attribute[0].attributes.first()
+    attribute_value = assigned_attribute.attribute.values.first()
+    attribute_value.translations.create(
+        language_code="pl", name=base_text, rich_text=rich_text
+    )
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_base_text = "Nowy Opis"
+    expected_rich_text = json.dumps(dummy_editorjs(expected_base_text))
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"name": None, "richText": expected_rich_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == expected_base_text
+    assert data["attributeValue"]["translation"]["richText"] == expected_rich_text
+
+
+def test_plain_text_attribute_value_update_translation_only_plain_text(
+    staff_api_client,
+    variant,
+    plain_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    product_type = variant.product.product_type
+    product_type.variant_attributes.set([plain_text_attribute])
+
+    attribute_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        variant, plain_text_attribute, attribute_value
+    )
+
+    text = "Jakiś bazowy opis"
+    attribute_value.translations.create(language_code="pl", plain_text=text)
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_text = "Nowy Opis"
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"plainText": expected_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == expected_text
+    assert data["attributeValue"]["translation"]["plainText"] == expected_text
+
+
+def test_plain_text_attribute_value_update_translation_only_plain_text_long_text(
+    staff_api_client,
+    variant,
+    plain_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    product_type = variant.product.product_type
+    product_type.variant_attributes.set([plain_text_attribute])
+
+    attribute_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        variant, plain_text_attribute, attribute_value
+    )
+
+    text = "Jakiś bazowy opis"
+    attribute_value.translations.create(language_code="pl", plain_text=text)
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_base_text = "Nowy Opis. " * 100
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"plainText": expected_base_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert (
+        data["attributeValue"]["translation"]["name"] == expected_base_text[:99] + "…"
+    )
+    assert data["attributeValue"]["translation"]["plainText"] == expected_base_text
+
+
+def test_plain_text_attribute_value_update_translation_name_set_manually(
+    staff_api_client,
+    variant,
+    plain_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    product_type = variant.product.product_type
+    product_type.variant_attributes.set([plain_text_attribute])
+
+    attribute_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        variant, plain_text_attribute, attribute_value
+    )
+
+    text = "Jakiś bazowy opis"
+    attribute_value.translations.create(language_code="pl", plain_text=text)
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_name = "Moja nazwa attrybutu"
+    expected_text = "Nowy Opis"
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"name": expected_name, "plainText": expected_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == expected_name
+    assert data["attributeValue"]["translation"]["plainText"] == expected_text
+
+
+def test_plain_text_attribute_value_update_translation_empty_name(
+    staff_api_client,
+    variant,
+    plain_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    product_type = variant.product.product_type
+    product_type.variant_attributes.set([plain_text_attribute])
+
+    attribute_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        variant, plain_text_attribute, attribute_value
+    )
+
+    text = "Jakiś bazowy opis"
+    attribute_value.translations.create(language_code="pl", plain_text=text)
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_text = "Nowy Opis"
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"name": "", "plainText": expected_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == ""
+    assert data["attributeValue"]["translation"]["plainText"] == expected_text
+
+
+def test_plain_text_attribute_value_update_translation_name_null(
+    staff_api_client,
+    variant,
+    plain_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    product_type = variant.product.product_type
+    product_type.variant_attributes.set([plain_text_attribute])
+
+    attribute_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        variant, plain_text_attribute, attribute_value
+    )
+
+    text = "Jakiś bazowy opis"
+    attribute_value.translations.create(language_code="pl", plain_text=text)
+    attribute_value_id = graphene.Node.to_global_id(
+        "AttributeValue", attribute_value.id
+    )
+    expected_text = "Nowy Opis"
+
+    # when
+    response = staff_api_client.post_graphql(
+        ATTRIBUTE_VALUE_TRANSLATE_MUTATION,
+        {
+            "attributeValueId": attribute_value_id,
+            "input": {"name": None, "plainText": expected_text},
+        },
+        permissions=[permission_manage_translations],
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]["attributeValueTranslate"]
+    assert data["attributeValue"]["translation"]["language"]["code"] == "PL"
+    assert data["attributeValue"]["translation"]["name"] == expected_text
+    assert data["attributeValue"]["translation"]["plainText"] == expected_text
 
 
 SHIPPING_PRICE_TRANSLATE = """
@@ -1951,14 +2573,18 @@ SHIPPING_PRICE_TRANSLATE = """
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_shipping_method_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     shipping_method,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
     shipping_method_id = graphene.Node.to_global_id(
         "ShippingMethodType", shipping_method.id
@@ -1982,7 +2608,11 @@ def test_shipping_method_create_translation(
     translation = shipping_method.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -2012,14 +2642,18 @@ def test_shipping_method_create_translation_by_translatable_content_id(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_shipping_method_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     shipping_method,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = shipping_method.translations.create(language_code="pl", name="DHL")
@@ -2057,7 +2691,11 @@ def test_shipping_method_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -2081,14 +2719,18 @@ MENU_ITEM_TRANSLATE = """
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_menu_item_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     menu_item,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = menu_item.translations.create(language_code="pl", name="Odnośnik")
@@ -2109,7 +2751,11 @@ def test_menu_item_update_translation(
     translation.refresh_from_db()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_UPDATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -2130,14 +2776,18 @@ def test_menu_item_create_translation_by_translatable_content_id(
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_shop_create_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     site_settings,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     query = """
@@ -2167,7 +2817,11 @@ def test_shop_create_translation(
     translation = site_settings.translations.first()
     expected_payload = generate_translation_payload(translation, staff_api_client.user)
     mocked_webhook_trigger.assert_called_once_with(
-        expected_payload, WebhookEventAsyncType.TRANSLATION_CREATED
+        expected_payload,
+        WebhookEventAsyncType.TRANSLATION_CREATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -2193,14 +2847,18 @@ SHOP_SETTINGS_TRANSLATE_MUTATION = """
 
 
 @freeze_time("1914-06-28 10:50")
+@patch("saleor.plugins.webhook.plugin.get_webhooks_for_event")
 @patch("saleor.plugins.webhook.plugin.trigger_webhooks_async")
 def test_shop_update_translation(
     mocked_webhook_trigger,
+    mocked_get_webhooks_for_event,
+    any_webhook,
     staff_api_client,
     site_settings,
     permission_manage_translations,
     settings,
 ):
+    mocked_get_webhooks_for_event.return_value = [any_webhook]
     settings.PLUGINS = ["saleor.plugins.webhook.plugin.WebhookPlugin"]
 
     translation = site_settings.translations.create(
@@ -2222,6 +2880,9 @@ def test_shop_update_translation(
     mocked_webhook_trigger.assert_called_once_with(
         expected_payload,
         WebhookEventAsyncType.TRANSLATION_UPDATED,
+        [any_webhook],
+        translation,
+        SimpleLazyObject(lambda: staff_api_client.user),
     )
 
 
@@ -2908,21 +3569,7 @@ def test_product_and_attribute_translation(user_api_client, product, channel_USD
     assert attribute_translation_data["language"]["code"] == "PL"
 
 
-def test_product_attribute_value_rich_text_translation(
-    staff_api_client,
-    product_with_rich_text_attribute,
-    permission_manage_translations,
-):
-    rich_text = dummy_editorjs("Test_dummy_data")
-    assigned_attribute = product_with_rich_text_attribute[0].attributes.first()
-    attribute_value = assigned_attribute.attribute.values.first()
-    attribute_value.translations.create(language_code="pl", rich_text=rich_text)
-
-    product_id = graphene.Node.to_global_id(
-        "Product", product_with_rich_text_attribute[0].id
-    )
-
-    query = """
+PRODUCT_ATTRIBUTE_VALUES_TRANSLATION_QUERY = """
         query translation(
             $kind: TranslatableKinds!
             $id: ID!
@@ -2934,24 +3581,53 @@ def test_product_attribute_value_rich_text_translation(
                     attributeValues {
                         name
                         richText
+                        plainText
                         translation(languageCode: $languageCode) {
                             name
                             richText
+                            plainText
+                        }
+                        attribute {
+                            name
+                            translation(languageCode: $languageCode) {
+                                name
+                            }
                         }
                     }
                 }
             }
         }
     """
+
+
+def test_product_attribute_value_rich_text_translation(
+    staff_api_client,
+    product_with_rich_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    rich_text = dummy_editorjs("Test_dummy_data")
+    assigned_attribute = product_with_rich_text_attribute[0].attributes.first()
+    attribute_value = assigned_attribute.attribute.values.first()
+    attribute_value.translations.create(language_code="pl", rich_text=rich_text)
+
+    product_id = graphene.Node.to_global_id(
+        "Product", product_with_rich_text_attribute[0].id
+    )
+
+    query = PRODUCT_ATTRIBUTE_VALUES_TRANSLATION_QUERY
     variables = {
         "id": product_id,
         "kind": TranslatableKinds.PRODUCT.name,
         "languageCode": LanguageCodeEnum.PL.name,
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_translations]
     )
+
+    # then
     data = get_graphql_content(response)["data"]
 
     attribute_value_response = data["translation"]["attributeValues"][0]
@@ -2960,12 +3636,125 @@ def test_product_attribute_value_rich_text_translation(
     assert attribute_value_response["translation"]["richText"] == json.dumps(rich_text)
 
 
+def test_product_attribute_value_plain_text_translation(
+    staff_api_client,
+    plain_text_attribute,
+    product,
+    permission_manage_translations,
+):
+    # given
+    product_type = product.product_type
+    product_type.product_attributes.set([plain_text_attribute])
+
+    product_attr_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        product, plain_text_attribute, product_attr_value
+    )
+
+    text = "Test plain text translation"
+    product_attr_value.translations.create(language_code="pl", plain_text=text)
+
+    product_id = graphene.Node.to_global_id("Product", product.id)
+
+    query = PRODUCT_ATTRIBUTE_VALUES_TRANSLATION_QUERY
+    variables = {
+        "id": product_id,
+        "kind": TranslatableKinds.PRODUCT.name,
+        "languageCode": LanguageCodeEnum.PL.name,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_translations]
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]
+
+    attribute_value_response = data["translation"]["attributeValues"][0]
+    assert attribute_value_response["name"] == product_attr_value.name
+    assert attribute_value_response["plainText"] == product_attr_value.plain_text
+    assert attribute_value_response["translation"]["plainText"] == text
+
+
+def test_nested_product_attribute_translation(
+    staff_api_client,
+    plain_text_attribute,
+    product,
+    permission_manage_translations,
+):
+    # given
+    product_type = product.product_type
+    product_type.product_attributes.set([plain_text_attribute])
+
+    product_attr_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        product, plain_text_attribute, product_attr_value
+    )
+
+    text = "Test attribute translation"
+    plain_text_attribute.translations.create(language_code="pl", name=text)
+
+    product_id = graphene.Node.to_global_id("Product", product.id)
+
+    query = PRODUCT_ATTRIBUTE_VALUES_TRANSLATION_QUERY
+    variables = {
+        "id": product_id,
+        "kind": TranslatableKinds.PRODUCT.name,
+        "languageCode": LanguageCodeEnum.PL.name,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_translations]
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]
+
+    attribute_response = data["translation"]["attributeValues"][0]["attribute"]
+    assert attribute_response["name"] == plain_text_attribute.name
+    assert attribute_response["translation"]["name"] == text
+
+
+PRODUCT_VARIANT_ATTRIBUTE_VALUES_TRANSLATION_QUERY = """
+    query translation(
+        $kind: TranslatableKinds!
+        $id: ID!
+        $languageCode: LanguageCodeEnum!
+    ) {
+        translation(kind: $kind, id: $id) {
+            ... on ProductVariantTranslatableContent {
+                name
+                attributeValues {
+                    name
+                    richText
+                    plainText
+                    translation(languageCode: $languageCode) {
+                        name
+                        richText
+                        plainText
+                    }
+                    attribute {
+                        name
+                        translation(languageCode: $languageCode) {
+                            name
+                        }
+                    }
+                }
+            }
+        }
+    }
+"""
+
+
 def test_product_variant_attribute_value_rich_text_translation(
     staff_api_client,
     product_with_rich_text_attribute,
     permission_manage_translations,
     product_type_with_rich_text_attribute,
 ):
+    # given
     rich_text = dummy_editorjs("Test_dummy_data")
     variant_attr = product_type_with_rich_text_attribute.variant_attributes.first()
     attribute_value = variant_attr.values.first()
@@ -2975,42 +3764,136 @@ def test_product_variant_attribute_value_rich_text_translation(
         "ProductVariant", product_with_rich_text_attribute[1].id
     )
 
-    query = """
-        query translation(
-            $kind: TranslatableKinds!
-            $id: ID!
-            $languageCode: LanguageCodeEnum!
-        ) {
-            translation(kind: $kind, id: $id) {
-                ... on ProductVariantTranslatableContent {
-                    name
-                    attributeValues {
-                        name
-                        richText
-                        translation(languageCode: $languageCode) {
-                            name
-                            richText
-                        }
-                    }
-                }
-            }
-        }
-    """
+    query = PRODUCT_VARIANT_ATTRIBUTE_VALUES_TRANSLATION_QUERY
     variables = {
         "id": variant_id,
         "kind": TranslatableKinds.VARIANT.name,
         "languageCode": LanguageCodeEnum.PL.name,
     }
 
+    # when
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_translations]
     )
+
+    # then
     data = get_graphql_content(response)["data"]
 
     translations_response = data["translation"]["attributeValues"][0]
     assert translations_response["name"] == attribute_value.name
     assert translations_response["richText"] == json.dumps(attribute_value.rich_text)
     assert translations_response["translation"]["richText"] == json.dumps(rich_text)
+
+
+def test_product_variant_attribute_value_plain_text_translation(
+    staff_api_client,
+    variant,
+    plain_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    product_type = variant.product.product_type
+    product_type.variant_attributes.set([plain_text_attribute])
+
+    attribute_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        variant, plain_text_attribute, attribute_value
+    )
+
+    text = "Test plain text translation"
+    attribute_value.translations.create(language_code="pl", plain_text=text)
+
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+
+    query = PRODUCT_VARIANT_ATTRIBUTE_VALUES_TRANSLATION_QUERY
+    variables = {
+        "id": variant_id,
+        "kind": TranslatableKinds.VARIANT.name,
+        "languageCode": LanguageCodeEnum.PL.name,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_translations]
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]
+
+    translations_response = data["translation"]["attributeValues"][0]
+    assert translations_response["name"] == attribute_value.name
+    assert translations_response["plainText"] == attribute_value.plain_text
+    assert translations_response["translation"]["plainText"] == text
+
+
+def test_nested_product_variant_attribute_translation(
+    staff_api_client,
+    variant,
+    plain_text_attribute,
+    permission_manage_translations,
+):
+    # given
+    product_type = variant.product.product_type
+    product_type.variant_attributes.set([plain_text_attribute])
+
+    attribute_value = plain_text_attribute.values.first()
+    associate_attribute_values_to_instance(
+        variant, plain_text_attribute, attribute_value
+    )
+
+    text = "Test attribute translation"
+    plain_text_attribute.translations.create(language_code="pl", name=text)
+
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+
+    query = PRODUCT_VARIANT_ATTRIBUTE_VALUES_TRANSLATION_QUERY
+    variables = {
+        "id": variant_id,
+        "kind": TranslatableKinds.VARIANT.name,
+        "languageCode": LanguageCodeEnum.PL.name,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_translations]
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]
+
+    attribute_response = data["translation"]["attributeValues"][0]["attribute"]
+    assert attribute_response["name"] == plain_text_attribute.name
+    assert attribute_response["translation"]["name"] == text
+
+
+PAGE_ATTRIBUTE_VALUES_TRANSLATION_QUERY = """
+    query translation(
+        $kind: TranslatableKinds!
+        $id: ID!
+        $languageCode: LanguageCodeEnum!
+    ) {
+        translation(kind: $kind, id: $id) {
+            ... on PageTranslatableContent {
+                attributeValues {
+                    name
+                    richText
+                    plainText
+                    translation(languageCode: $languageCode) {
+                        name
+                        richText
+                        plainText
+                    }
+                    attribute {
+                        name
+                        translation(languageCode: $languageCode) {
+                            name
+                        }
+                    }
+                }
+            }
+        }
+    }
+"""
 
 
 def test_page_attribute_value_rich_text_translation(
@@ -3027,27 +3910,7 @@ def test_page_attribute_value_rich_text_translation(
 
     page_id = graphene.Node.to_global_id("Page", page_with_rich_text_attribute.id)
 
-    query = """
-        query translation(
-            $kind: TranslatableKinds!
-            $id: ID!
-            $languageCode: LanguageCodeEnum!
-        ) {
-            translation(kind: $kind, id: $id) {
-                ... on PageTranslatableContent {
-                    attributeValues {
-                        name
-                        richText
-                        translation(languageCode: $languageCode) {
-                            name
-                            richText
-                        }
-                    }
-                }
-            }
-        }
-
-    """
+    query = PAGE_ATTRIBUTE_VALUES_TRANSLATION_QUERY
 
     variables = {
         "id": page_id,
@@ -3063,3 +3926,87 @@ def test_page_attribute_value_rich_text_translation(
     assert attribute_value_response["name"] == attribute_value.name
     assert attribute_value_response["richText"] == json.dumps(attribute_value.rich_text)
     assert attribute_value_response["translation"]["richText"] == json.dumps(rich_text)
+
+
+def test_page_attribute_value_plain_text_translation(
+    staff_api_client,
+    plain_text_attribute_page_type,
+    page,
+    permission_manage_translations,
+    permission_manage_pages,
+):
+    # given
+    page_type = page.page_type
+    page_type.page_attributes.set([plain_text_attribute_page_type])
+    attribute_value = plain_text_attribute_page_type.values.first()
+
+    associate_attribute_values_to_instance(
+        page, plain_text_attribute_page_type, attribute_value
+    )
+
+    text = "Test plain text translation"
+    attribute_value.translations.create(language_code="pl", plain_text=text)
+
+    page_id = graphene.Node.to_global_id("Page", page.id)
+
+    query = PAGE_ATTRIBUTE_VALUES_TRANSLATION_QUERY
+
+    variables = {
+        "id": page_id,
+        "kind": TranslatableKinds.PAGE.name,
+        "languageCode": LanguageCodeEnum.PL.name,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_translations]
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]
+
+    attribute_value_response = data["translation"]["attributeValues"][0]
+    assert attribute_value_response["name"] == attribute_value.name
+    assert attribute_value_response["plainText"] == attribute_value.plain_text
+    assert attribute_value_response["translation"]["plainText"] == text
+
+
+def test_nested_page_attribute_translation(
+    staff_api_client,
+    plain_text_attribute_page_type,
+    page,
+    permission_manage_translations,
+    permission_manage_pages,
+):
+    # given
+    page_type = page.page_type
+    page_type.page_attributes.set([plain_text_attribute_page_type])
+    attribute_value = plain_text_attribute_page_type.values.first()
+
+    associate_attribute_values_to_instance(
+        page, plain_text_attribute_page_type, attribute_value
+    )
+
+    text = "Test attribute translation"
+    plain_text_attribute_page_type.translations.create(language_code="pl", name=text)
+
+    page_id = graphene.Node.to_global_id("Page", page.id)
+
+    query = PAGE_ATTRIBUTE_VALUES_TRANSLATION_QUERY
+    variables = {
+        "id": page_id,
+        "kind": TranslatableKinds.PAGE.name,
+        "languageCode": LanguageCodeEnum.PL.name,
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_translations]
+    )
+
+    # then
+    data = get_graphql_content(response)["data"]
+
+    attribute_response = data["translation"]["attributeValues"][0]["attribute"]
+    assert attribute_response["name"] == plain_text_attribute_page_type.name
+    assert attribute_response["translation"]["name"] == text

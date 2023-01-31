@@ -1,17 +1,18 @@
 import graphene
 from django.core.exceptions import ValidationError
 
-from ....core.permissions import OrderPermissions
 from ....order import OrderStatus, models
 from ....order.error_codes import OrderErrorCode
+from ....permission.enums import OrderPermissions
+from ...core import ResolveInfo
 from ...core.mutations import ModelBulkDeleteMutation
-from ...core.types.common import OrderError
+from ...core.types import NonNullList, OrderError
 from ..types import Order, OrderLine
 
 
 class DraftOrderBulkDelete(ModelBulkDeleteMutation):
     class Arguments:
-        ids = graphene.List(
+        ids = NonNullList(
             graphene.ID, required=True, description="List of draft order IDs to delete."
         )
 
@@ -24,13 +25,13 @@ class DraftOrderBulkDelete(ModelBulkDeleteMutation):
         error_type_field = "order_errors"
 
     @classmethod
-    def clean_instance(cls, info, instance):
+    def clean_instance(cls, _info: ResolveInfo, instance):
         if instance.status != OrderStatus.DRAFT:
             raise ValidationError(
                 {
                     "id": ValidationError(
                         "Cannot delete non-draft orders.",
-                        code=OrderErrorCode.CANNOT_DELETE,
+                        code=OrderErrorCode.CANNOT_DELETE.value,
                     )
                 }
             )
@@ -38,7 +39,7 @@ class DraftOrderBulkDelete(ModelBulkDeleteMutation):
 
 class DraftOrderLinesBulkDelete(ModelBulkDeleteMutation):
     class Arguments:
-        ids = graphene.List(
+        ids = NonNullList(
             graphene.ID, required=True, description="List of order lines IDs to delete."
         )
 
@@ -51,13 +52,13 @@ class DraftOrderLinesBulkDelete(ModelBulkDeleteMutation):
         error_type_field = "order_errors"
 
     @classmethod
-    def clean_instance(cls, _info, instance):
+    def clean_instance(cls, _info: ResolveInfo, instance):
         if instance.order.status != OrderStatus.DRAFT:
             raise ValidationError(
                 {
                     "id": ValidationError(
                         "Cannot delete line for non-draft orders.",
-                        code=OrderErrorCode.CANNOT_DELETE,
+                        code=OrderErrorCode.CANNOT_DELETE.value,
                     )
                 }
             )

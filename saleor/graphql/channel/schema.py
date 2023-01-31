@@ -1,12 +1,16 @@
 import graphene
 
-from ..core.utils import from_global_id_or_error
-from ..decorators import staff_member_or_app_required
+from ...permission.auth_filters import AuthorizationFilters
+from ..core import ResolveInfo
+from ..core.descriptions import ADDED_IN_36, PREVIEW_FEATURE
+from ..core.fields import PermissionsField
+from ..core.types import NonNullList
 from .mutations import (
     ChannelActivate,
     ChannelCreate,
     ChannelDeactivate,
     ChannelDelete,
+    ChannelReorderWarehouses,
     ChannelUpdate,
 )
 from .resolvers import resolve_channel, resolve_channels
@@ -16,20 +20,31 @@ from .types import Channel
 class ChannelQueries(graphene.ObjectType):
     channel = graphene.Field(
         Channel,
-        id=graphene.Argument(graphene.ID, description="ID of the channel."),
-        description="Look up a channel by ID.",
+        id=graphene.Argument(
+            graphene.ID, description="ID of the channel.", required=False
+        ),
+        slug=graphene.Argument(
+            graphene.String,
+            description="Slug of the channel." + ADDED_IN_36 + PREVIEW_FEATURE,
+            required=False,
+        ),
+        description="Look up a channel by ID or slug.",
     )
-    channels = graphene.List(
-        graphene.NonNull(Channel), description="List of all channels."
+    channels = PermissionsField(
+        NonNullList(Channel),
+        description="List of all channels.",
+        permissions=[
+            AuthorizationFilters.AUTHENTICATED_APP,
+            AuthorizationFilters.AUTHENTICATED_STAFF_USER,
+        ],
     )
 
-    @staff_member_or_app_required
-    def resolve_channel(self, info, id=None, **kwargs):
-        _, id = from_global_id_or_error(id, Channel)
-        return resolve_channel(id)
+    @staticmethod
+    def resolve_channel(_root, info: ResolveInfo, *, id=None, slug=None, **kwargs):
+        return resolve_channel(info, id, slug)
 
-    @staff_member_or_app_required
-    def resolve_channels(self, _info, **kwargs):
+    @staticmethod
+    def resolve_channels(_root, _info: ResolveInfo, **kwargs):
         return resolve_channels()
 
 
@@ -39,3 +54,4 @@ class ChannelMutations(graphene.ObjectType):
     channel_delete = ChannelDelete.Field()
     channel_activate = ChannelActivate.Field()
     channel_deactivate = ChannelDeactivate.Field()
+    channel_reorder_warehouses = ChannelReorderWarehouses.Field()

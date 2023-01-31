@@ -1,11 +1,16 @@
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
+import graphene
 import graphql
 from measurement.measures import Weight
 from prices import Money
 
 from ..graphql.core.utils import from_global_id_or_error
+from ..plugins.webhook.utils import APP_ID_PREFIX
+
+if TYPE_CHECKING:
+    from ..tax.models import TaxClass
 
 
 @dataclass
@@ -25,6 +30,7 @@ class ShippingMethodData:
     minimum_delivery_days: Optional[int] = None
     metadata: Dict[str, str] = field(default_factory=dict)
     private_metadata: Dict[str, str] = field(default_factory=dict)
+    tax_class: Optional["TaxClass"] = None
     active: bool = True
     message: str = ""
 
@@ -36,6 +42,12 @@ class ShippingMethodData:
         except graphql.error.base.GraphQLError:
             pass
         else:
-            return str_type == "app"
+            return str_type == APP_ID_PREFIX
 
         return False
+
+    @property
+    def graphql_id(self):
+        if self.is_external:
+            return self.id
+        return graphene.Node.to_global_id("ShippingMethod", self.id)

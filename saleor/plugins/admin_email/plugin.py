@@ -1,6 +1,6 @@
 import logging
-from dataclasses import asdict, dataclass
-from typing import List, Optional, Union
+from dataclasses import asdict
+from typing import List, Union
 
 from django.conf import settings
 from promise.promise import Promise
@@ -29,27 +29,6 @@ from .notify_events import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class AdminTemplate:
-    staff_order_confirmation: Optional[str]
-    set_staff_password_email: Optional[str]
-    csv_export_success: Optional[str]
-    csv_export_failed: Optional[str]
-    staff_reset_password: Optional[str]
-
-
-def get_admin_template_map(templates: AdminTemplate):
-    return {
-        AdminNotifyEvent.STAFF_ORDER_CONFIRMATION: templates.staff_order_confirmation,
-        AdminNotifyEvent.ACCOUNT_SET_STAFF_PASSWORD: templates.set_staff_password_email,
-        AdminNotifyEvent.CSV_EXPORT_SUCCESS: (templates.csv_export_success),
-        AdminNotifyEvent.CSV_EXPORT_FAILED: templates.csv_export_failed,
-        AdminNotifyEvent.ACCOUNT_STAFF_RESET_PASSWORD: (
-            templates.set_staff_password_email
-        ),
-    }
 
 
 def get_admin_event_map():
@@ -110,7 +89,7 @@ class AdminEmailPlugin(BasePlugin):
             "name": constants.CSV_EXPORT_FAILED_TEMPLATE_FIELD,
             "value": DEFAULT_EMAIL_VALUE,
         },
-    ] + DEFAULT_EMAIL_CONFIGURATION  # type: ignore
+    ] + DEFAULT_EMAIL_CONFIGURATION
 
     CONFIG_STRUCTURE = {
         constants.STAFF_PASSWORD_RESET_SUBJECT_FIELD: {
@@ -201,22 +180,6 @@ class AdminEmailPlugin(BasePlugin):
             use_ssl=configuration["use_ssl"] or settings.EMAIL_USE_SSL,
         )
 
-        self.templates = AdminTemplate(
-            csv_export_failed=configuration[constants.CSV_EXPORT_FAILED_TEMPLATE_FIELD],
-            csv_export_success=configuration[
-                constants.CSV_EXPORT_SUCCESS_TEMPLATE_FIELD
-            ],
-            set_staff_password_email=configuration[
-                constants.SET_STAFF_PASSWORD_TEMPLATE_FIELD
-            ],
-            staff_order_confirmation=configuration[
-                constants.STAFF_ORDER_CONFIRMATION_TEMPLATE_FIELD
-            ],
-            staff_reset_password=configuration[
-                constants.STAFF_PASSWORD_RESET_TEMPLATE_FIELD
-            ],
-        )
-
     def resolve_plugin_configuration(
         self, request
     ) -> Union[PluginConfigurationType, Promise[PluginConfigurationType]]:
@@ -260,15 +223,11 @@ class AdminEmailPlugin(BasePlugin):
             return previous_value
 
         if event not in event_map:
-            logger.warning(f"Missing handler for event {event}")
-            return previous_value
-
-        template_map = get_admin_template_map(self.templates)
-        if not template_map.get(event):
+            logger.warning("Missing handler for event %s", event)
             return previous_value
 
         event_func = event_map[event]
-        config = asdict(self.config)  # type: ignore
+        config = asdict(self.config)
         event_func(payload, config, self)
 
     @classmethod

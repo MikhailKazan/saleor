@@ -1,7 +1,9 @@
 import graphene
 
-from ...core.permissions import GiftcardPermissions, OrderPermissions
-from ..decorators import permission_required
+from ...permission.enums import GiftcardPermissions, OrderPermissions
+from ..core.descriptions import DEPRECATED_IN_3X_MUTATION
+from ..core.fields import PermissionsField
+from ..site.dataloaders import load_site_callback
 from ..translations.mutations import ShopSettingsTranslate
 from .mutations import (
     GiftCardSettingsUpdate,
@@ -23,25 +25,28 @@ class ShopQueries(graphene.ObjectType):
         description="Return information about the shop.",
         required=True,
     )
-    order_settings = graphene.Field(
-        OrderSettings, description="Order related settings from site settings."
+    order_settings = PermissionsField(
+        OrderSettings,
+        description="Order related settings from site settings.",
+        permissions=[OrderPermissions.MANAGE_ORDERS],
     )
-    gift_card_settings = graphene.Field(
+    gift_card_settings = PermissionsField(
         GiftCardSettings,
         description="Gift card related settings from site settings.",
         required=True,
+        permissions=[GiftcardPermissions.MANAGE_GIFT_CARD],
     )
 
     def resolve_shop(self, _info):
         return Shop()
 
-    @permission_required(OrderPermissions.MANAGE_ORDERS)
-    def resolve_order_settings(self, info, *args, **_kwargs):
-        return info.context.site.settings
+    @load_site_callback
+    def resolve_order_settings(self, _info, site):
+        return site.settings
 
-    @permission_required(GiftcardPermissions.MANAGE_GIFT_CARD)
-    def resolve_gift_card_settings(self, info, *args, **_kwargs):
-        return info.context.site.settings
+    @load_site_callback
+    def resolve_gift_card_settings(self, _info, site):
+        return site.settings
 
 
 class ShopMutations(graphene.ObjectType):
@@ -51,7 +56,9 @@ class ShopMutations(graphene.ObjectType):
 
     shop_domain_update = ShopDomainUpdate.Field()
     shop_settings_update = ShopSettingsUpdate.Field()
-    shop_fetch_tax_rates = ShopFetchTaxRates.Field()
+    shop_fetch_tax_rates = ShopFetchTaxRates.Field(
+        deprecation_reason=DEPRECATED_IN_3X_MUTATION
+    )
     shop_settings_translate = ShopSettingsTranslate.Field()
     shop_address_update = ShopAddressUpdate.Field()
 

@@ -1,10 +1,14 @@
+import math
 from collections import defaultdict, namedtuple
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, cast
+from uuid import UUID
 
 from django.db import transaction
 from django.db.models import F, Sum
+from django.db.models.expressions import Exists, OuterRef
 from django.db.models.functions import Coalesce
 
+from ..channel import AllocationStrategy
 from ..checkout.models import CheckoutLine
 from ..core.exceptions import (
     AllocationError,
@@ -14,10 +18,12 @@ from ..core.exceptions import (
 )
 from ..core.tracing import traced_atomic_transaction
 from ..order.fetch import OrderLineInfo
+from ..order.models import OrderLine
 from ..plugins.manager import PluginsManager
 from ..product.models import ProductVariant, ProductVariantChannelListing
 from .models import (
     Allocation,
+    ChannelWarehouse,
     PreorderAllocation,
     PreorderReservation,
     Reservation,
@@ -26,7 +32,8 @@ from .models import (
 )
 
 if TYPE_CHECKING:
-    from ..order.models import Order, OrderLine
+    from ..channel.models import Channel
+    from ..order.models import Order
 
 
 StockData = namedtuple("StockData", ["pk", "quantity"])
@@ -36,8 +43,9 @@ StockData = namedtuple("StockData", ["pk", "quantity"])
 def allocate_stocks(
     order_lines_info: Iterable["OrderLineInfo"],
     country_code: str,
-    channel_slug: str,
+    channel: "Channel",
     manager: PluginsManager,
+    collection_point_pk: Optional[UUID] = None,
     additional_filter_lookup: Optional[Dict[str, Any]] = None,
     check_reservations: bool = False,
     checkout_lines: Optional[Iterable["CheckoutLine"]] = None,
@@ -57,39 +65,33 @@ def allocate_stocks(
     if not order_lines_info:
         return
 
+    channel_slug = channel.slug
+
     variants = [line_info.variant for line_info in order_lines_info]
     filter_lookup = {"product_variant__in": variants}
 
     if additional_filter_lookup is not None:
         filter_lookup.update(additional_filter_lookup)
 
+    # in case of click and collect order, we need to check local or global stock
+    # regardless of the country code
+    stocks = (
+        Stock.objects.for_channel_and_click_and_collect(channel_slug)
+        if collection_point_pk
+        else Stock.objects.for_channel_and_country(channel_slug, country_code)
+    )
+
     stocks = list(
-        Stock.objects.select_for_update(of=("self",))
-        .for_country_and_channel(country_code, channel_slug)
+        stocks.select_for_update(of=("self",))
         .filter(**filter_lookup)
         .order_by("pk")
-        .values("id", "product_variant", "pk", "quantity")
+        .values("id", "product_variant", "pk", "quantity", "warehouse_id")
     )
-    stocks_id = [stock.pop("id") for stock in stocks]
+    stocks_id = (stock.pop("id") for stock in stocks)
 
-    quantity_reservation_for_stocks: Dict = defaultdict(int)
-
-    if check_reservations:
-        quantity_reservation = (
-            Reservation.objects.filter(
-                stock_id__in=stocks_id,
-            )
-            .not_expired()
-            .exclude_checkout_lines(checkout_lines or [])
-            .values("stock")
-            .annotate(
-                quantity_reserved=Coalesce(Sum("quantity_reserved"), 0),
-            )
-        )  # type: ignore
-        for reservation in quantity_reservation:
-            quantity_reservation_for_stocks[reservation["stock"]] += reservation[
-                "quantity_reserved"
-            ]
+    quantity_reservation_for_stocks: Dict = _prepare_stock_to_reserved_quantity_map(
+        checkout_lines, check_reservations, stocks_id
+    )
 
     quantity_allocation_list = list(
         Allocation.objects.filter(
@@ -100,12 +102,20 @@ def allocate_stocks(
         .annotate(quantity_allocated_sum=Sum("quantity_allocated"))
     )
     quantity_allocation_for_stocks: Dict = defaultdict(int)
-    for allocation in quantity_allocation_list:
-        quantity_allocation_for_stocks[allocation["stock"]] += allocation[
+    for allocation_data in quantity_allocation_list:
+        quantity_allocation_for_stocks[allocation_data["stock"]] += allocation_data[
             "quantity_allocated_sum"
         ]
 
-    variant_to_stocks: Dict[str, List[StockData]] = defaultdict(list)
+    stocks = sort_stocks(
+        channel.allocation_strategy,
+        stocks,
+        channel,
+        quantity_allocation_for_stocks,
+        collection_point_pk,
+    )
+
+    variant_to_stocks: Dict[int, List[StockData]] = defaultdict(list)
     for stock_data in stocks:
         variant = stock_data.pop("product_variant")
         variant_to_stocks[variant].append(StockData(**stock_data))
@@ -128,7 +138,14 @@ def allocate_stocks(
         raise InsufficientStock(insufficient_stock)
 
     if allocations:
-        Allocation.objects.bulk_create(allocations)
+        stocks_to_update = []
+        for alloc in Allocation.objects.bulk_create(allocations):
+            stock = alloc.stock
+            stock.quantity_allocated = (
+                F("quantity_allocated") + alloc.quantity_allocated
+            )
+            stocks_to_update.append(stock)
+        Stock.objects.bulk_update(stocks_to_update, ["quantity_allocated"])
 
         for allocation in allocations:
             allocated_stock = (
@@ -141,6 +158,79 @@ def allocate_stocks(
                 transaction.on_commit(
                     lambda: manager.product_variant_out_of_stock(allocation.stock)
                 )
+
+
+def _prepare_stock_to_reserved_quantity_map(
+    checkout_lines, check_reservations, stocks_id
+):
+    """Prepare stock id to quantity reserved map for provided stock ids."""
+    quantity_reservation_for_stocks: Dict = defaultdict(int)
+
+    if check_reservations:
+        quantity_reservation = (
+            Reservation.objects.filter(
+                stock_id__in=stocks_id,
+            )
+            .not_expired()
+            .exclude_checkout_lines(checkout_lines or [])
+            .values("stock")
+            .annotate(
+                quantity_reserved=Coalesce(Sum("quantity_reserved"), 0),
+            )
+        )
+        for reservation in quantity_reservation:
+            quantity_reservation_for_stocks[reservation["stock"]] += reservation[
+                "quantity_reserved"
+            ]
+    return quantity_reservation_for_stocks
+
+
+def sort_stocks(
+    allocation_strategy: str,
+    stocks: List[dict],
+    channel: "Channel",
+    quantity_allocation_for_stocks: Dict[int, int],
+    collection_point_pk: Optional[UUID] = None,
+):
+    warehouse_ids = [stock_data["warehouse_id"] for stock_data in stocks]
+    channel_warehouse_ids = ChannelWarehouse.objects.filter(
+        channel_id=channel.id, warehouse_id__in=warehouse_ids
+    ).values_list("warehouse_id", flat=True)
+
+    def sort_stocks_by_highest_stocks(stock_data):
+        """Sort the stocks by the highest quantity available."""
+        # in case of click and collect order we should allocate stocks from
+        # collection point warehouse at the first place
+        if stock_data.pop("warehouse_id") == collection_point_pk:
+            return math.inf
+        return stock_data["quantity"] - quantity_allocation_for_stocks.get(
+            stock_data["pk"], 0
+        )
+
+    def sort_stocks_by_warehouse_sorting_order(stock_data):
+        """Sort the stocks based on the warehouse within channel order."""
+        # get the sort order for stocks warehouses within the channel
+        sorted_warehouse_list = list(channel_warehouse_ids)
+
+        warehouse_id = stock_data.pop("warehouse_id")
+        # in case of click and collect order we should allocate stocks from
+        # collection point warehouse at the first place
+        if warehouse_id == collection_point_pk:
+            return -math.inf
+        return sorted_warehouse_list.index(warehouse_id)
+
+    allocation_strategy_to_sort_method_and_reverse_option = {
+        AllocationStrategy.PRIORITIZE_HIGH_STOCK: (sort_stocks_by_highest_stocks, True),
+        AllocationStrategy.PRIORITIZE_SORTING_ORDER: (
+            sort_stocks_by_warehouse_sorting_order,
+            False,
+        ),
+    }
+    sort_method, reverse = allocation_strategy_to_sort_method_and_reverse_option[
+        allocation_strategy
+    ]
+    stocks.sort(key=sort_method, reverse=reverse)
+    return stocks
 
 
 def _create_allocations(
@@ -177,7 +267,9 @@ def _create_allocations(
     if not quantity_allocated == quantity:
         insufficient_stock.append(
             InsufficientStockData(
-                variant=line_info.variant, order_line=line_info.line  # type: ignore
+                variant=line_info.variant,
+                order_line=line_info.line,
+                available_quantity=0,
             )
         )
         return insufficient_stock, []
@@ -207,11 +299,12 @@ def deallocate_stock(
         .order_by("stock__pk")
     )
 
-    line_to_allocations: Dict[int, List[Allocation]] = defaultdict(list)
+    line_to_allocations: Dict[UUID, List[Allocation]] = defaultdict(list)
     for allocation in lines_allocations:
         line_to_allocations[allocation.order_line_id].append(allocation)
 
     allocations_to_update = []
+    stocks_to_update = []
     not_dellocated_lines = []
     for line_info in order_lines_data:
         order_line = line_info.line
@@ -226,6 +319,11 @@ def deallocate_stock(
                 allocation.quantity_allocated = (
                     allocation.quantity_allocated - quantity_to_deallocate
                 )
+                stock = allocation.stock
+                stock.quantity_allocated = (
+                    F("quantity_allocated") - quantity_to_deallocate
+                )
+                stocks_to_update.append(stock)
                 quantity_dealocated += quantity_to_deallocate
                 allocations_to_update.append(allocation)
                 if quantity_dealocated == quantity:
@@ -255,13 +353,15 @@ def deallocate_stock(
                 )
             )
 
+    Stock.objects.bulk_update(stocks_to_update, ["quantity_allocated"])
+
     if not_dellocated_lines:
         raise AllocationError(not_dellocated_lines)
 
 
 @traced_atomic_transaction()
 def increase_stock(
-    order_line: "OrderLine",
+    order_line: OrderLine,
     warehouse: Warehouse,
     quantity: int,
     allocate: bool = False,
@@ -276,6 +376,7 @@ def increase_stock(
     function increase `quantity_allocated`. If allocation does not exist function
     create a new allocation for this order line in this stock.
     """
+    assert order_line.variant
     stock = (
         Stock.objects.select_for_update(of=("self",))
         .filter(warehouse=warehouse, product_variant=order_line.variant)
@@ -296,11 +397,13 @@ def increase_stock(
             Allocation.objects.create(
                 order_line=order_line, stock=stock, quantity_allocated=quantity
             )
+        stock.quantity_allocated = F("quantity_allocated") + quantity
+        stock.save(update_fields=["quantity_allocated"])
 
 
 @traced_atomic_transaction()
 def increase_allocations(
-    lines_info: Iterable["OrderLineInfo"], channel_slug: str, manager: PluginsManager
+    lines_info: Iterable["OrderLineInfo"], channel: "Channel", manager: PluginsManager
 ):
     """Increase allocation for order lines with appropriate quantity."""
     line_pks = [info.line.pk for info in lines_info]
@@ -311,7 +414,7 @@ def increase_allocations(
     )
     # evaluate allocations query to trigger select_for_update lock
     allocation_pks_to_delete = [alloc.pk for alloc in allocations]
-    allocation_quantity_map: Dict[int, list] = defaultdict(list)
+    allocation_quantity_map: Dict[UUID, list] = defaultdict(list)
 
     for alloc in allocations:
         allocation_quantity_map[alloc.order_line.pk].append(alloc.quantity_allocated)
@@ -321,12 +424,18 @@ def increase_allocations(
         # line_info.quantity resembles amount to add, sum it with already allocated.
         line_info.quantity += allocated
 
+    stocks_to_update = []
+    for alloc in allocations:
+        stock = alloc.stock
+        stock.quantity_allocated = F("quantity_allocated") - alloc.quantity_allocated
+        stocks_to_update.append(stock)
     Allocation.objects.filter(pk__in=allocation_pks_to_delete).delete()
+    Stock.objects.bulk_update(stocks_to_update, ["quantity_allocated"])
 
     allocate_stocks(
         lines_info,
         lines_info[0].line.order.shipping_address.country.code,  # type: ignore
-        channel_slug,
+        channel,
         manager,
     )
 
@@ -374,10 +483,10 @@ def decrease_stock(
         .order_by("pk")
     )
 
-    variant_and_warehouse_to_stock: Dict[int, Dict[str, Stock]] = defaultdict(dict)
+    variant_and_warehouse_to_stock: Dict[int, Dict[UUID, Stock]] = defaultdict(dict)
     for stock in stocks:
         variant_and_warehouse_to_stock[stock.product_variant_id][
-            str(stock.warehouse_id)
+            stock.warehouse_id
         ] = stock
 
     quantity_allocation_list = list(
@@ -389,12 +498,12 @@ def decrease_stock(
         .annotate(Sum("quantity_allocated"))
     )
 
-    quantity_allocation_for_stocks: Dict[int, int] = defaultdict(int)
-    for allocation in quantity_allocation_list:
-        quantity_allocation_for_stocks[allocation["stock"]] += allocation[
-            "quantity_allocated__sum"
-        ]
     if update_stocks:
+        quantity_allocation_for_stocks: Dict[int, int] = defaultdict(int)
+        for allocation in quantity_allocation_list:
+            quantity_allocation_for_stocks[allocation["stock"]] += allocation[
+                "quantity_allocated__sum"
+            ]
         _decrease_stocks_quantity(
             order_lines_info,
             variant_and_warehouse_to_stock,
@@ -414,7 +523,7 @@ def decrease_stock(
 
 def _decrease_stocks_quantity(
     order_lines_info: Iterable["OrderLineInfo"],
-    variant_and_warehouse_to_stock: Dict[int, Dict[str, Stock]],
+    variant_and_warehouse_to_stock: Dict[int, Dict[UUID, Stock]],
     quantity_allocation_for_stocks: Dict[int, int],
     allow_stock_to_be_exceeded: bool = False,
 ):
@@ -422,9 +531,13 @@ def _decrease_stocks_quantity(
     stocks_to_update = []
     for line_info in order_lines_info:
         variant = line_info.variant
-        warehouse_pk = str(line_info.warehouse_pk)
-        stock = variant_and_warehouse_to_stock.get(variant.pk, {}).get(  # type: ignore
-            warehouse_pk
+        warehouse_pk = line_info.warehouse_pk
+        stock = (
+            variant_and_warehouse_to_stock.get(variant.pk, {}).get(  # type: ignore
+                warehouse_pk
+            )
+            if warehouse_pk
+            else None
         )
         if stock is None:
             # If there is no stock but allow_stock_to_be_exceeded == True
@@ -432,7 +545,10 @@ def _decrease_stocks_quantity(
             if not allow_stock_to_be_exceeded:
                 insufficient_stocks.append(
                     InsufficientStockData(
-                        variant, line_info.line, warehouse_pk  # type: ignore
+                        variant=variant,
+                        order_line=line_info.line,
+                        warehouse_pk=warehouse_pk,
+                        available_quantity=0,
                     )
                 )
             continue
@@ -443,9 +559,10 @@ def _decrease_stocks_quantity(
         if is_stock_exceeded and not allow_stock_to_be_exceeded:
             insufficient_stocks.append(
                 InsufficientStockData(
-                    variant=variant,  # type: ignore
+                    variant=variant,
                     order_line=line_info.line,
                     warehouse_pk=warehouse_pk,
+                    available_quantity=0,
                 )
             )
             continue
@@ -474,9 +591,16 @@ def get_order_lines_with_track_inventory(
 @traced_atomic_transaction()
 def deallocate_stock_for_order(order: "Order", manager: PluginsManager):
     """Remove all allocations for given order."""
+    lines = OrderLine.objects.filter(order_id=order.id)
     allocations = Allocation.objects.filter(
-        order_line__order=order, quantity_allocated__gt=0
-    )
+        Exists(lines.filter(id=OuterRef("order_line_id"))), quantity_allocated__gt=0
+    ).select_related("stock")
+
+    stocks_to_update = []
+    for alloc in allocations:
+        stock = alloc.stock
+        stock.quantity_allocated = F("quantity_allocated") - alloc.quantity_allocated
+        stocks_to_update.append(stock)
 
     for allocation in allocations.annotate_stock_available_quantity():
         if allocation.stock_available_quantity <= 0:
@@ -485,6 +609,7 @@ def deallocate_stock_for_order(order: "Order", manager: PluginsManager):
             )
 
     allocations.update(quantity_allocated=0)
+    Stock.objects.bulk_update(stocks_to_update, ["quantity_allocated"])
 
 
 @traced_atomic_transaction()
@@ -550,7 +675,7 @@ def allocate_preorders(
             .exclude_checkout_lines(checkout_lines)
             .values("product_variant_channel_listing")
             .annotate(quantity_reserved_sum=Sum("quantity_reserved"))
-        )  # type: ignore
+        )
         listings_reservations: Dict = defaultdict(int)
         for reservation in quantity_reservation_list:
             listings_reservations[
@@ -665,10 +790,17 @@ def deactivate_preorder_for_variant(product_variant: ProductVariant):
 
     allocations_to_create = []
     stocks_to_create = []
+    stocks_to_update = []
     for preorder_allocation in preorder_allocations:
         stock = _get_stock_for_preorder_allocation(preorder_allocation, product_variant)
         if stock._state.adding:
+            stock.quantity_allocated += preorder_allocation.quantity
             stocks_to_create.append(stock)
+        else:
+            stock.quantity_allocated = (
+                F("quantity_allocated") + preorder_allocation.quantity
+            )
+            stocks_to_update.append(stock)
         allocations_to_create.append(
             Allocation(
                 order_line=preorder_allocation.order_line,
@@ -680,6 +812,9 @@ def deactivate_preorder_for_variant(product_variant: ProductVariant):
     if stocks_to_create:
         Stock.objects.bulk_create(stocks_to_create)
 
+    if stocks_to_update:
+        Stock.objects.bulk_update(stocks_to_update, ["quantity_allocated"])
+
     if allocations_to_create:
         Allocation.objects.bulk_create(allocations_to_create)
 
@@ -690,7 +825,12 @@ def deactivate_preorder_for_variant(product_variant: ProductVariant):
     product_variant.preorder_end_date = None
     product_variant.is_preorder = False
     product_variant.save(
-        update_fields=["preorder_global_threshold", "preorder_end_date", "is_preorder"]
+        update_fields=[
+            "preorder_global_threshold",
+            "preorder_end_date",
+            "is_preorder",
+            "updated_at",
+        ]
     )
 
     ProductVariantChannelListing.objects.filter(variant_id=product_variant.pk).update(

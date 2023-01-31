@@ -1,13 +1,13 @@
 import pytest
-from django.contrib.auth.models import Permission
 
-from ...core.permissions import (
+from ...permission.enums import (
     AppPermission,
     CheckoutPermissions,
     OrderPermissions,
     get_permissions_from_names,
 )
-from ...core.permissions import permission_required as core_permission_required
+from ...permission.models import Permission
+from ...permission.utils import permission_required as core_permission_required
 from ..utils import get_user_or_app_from_context
 
 
@@ -48,7 +48,7 @@ def test_permission_required_with_limited_permissions(
     request.user = staff_user
     request.app = None
     requestor = get_user_or_app_from_context(request)
-    has_perms = core_permission_required(permissions_required, requestor)
+    has_perms = core_permission_required(requestor, permissions_required)
     assert has_perms == access_granted
 
 
@@ -84,5 +84,5 @@ def test_permission_required(
     request.user = staff_user
     request.app = None
     requestor = get_user_or_app_from_context(request)
-    has_perms = core_permission_required(permissions_required, requestor)
+    has_perms = core_permission_required(requestor, permissions_required)
     assert has_perms == access_granted

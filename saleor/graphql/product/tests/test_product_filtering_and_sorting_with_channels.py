@@ -3,6 +3,8 @@ import uuid
 from decimal import Decimal
 
 import pytest
+import pytz
+from freezegun import freeze_time
 
 from ....product import ProductTypeKind
 from ....product.models import (
@@ -63,28 +65,39 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 channel=channel_USD,
                 is_published=True,
                 discounted_price_amount=Decimal(5),
-                publication_date=datetime.date(2002, 1, 1),
+                published_at=datetime.datetime(2002, 1, 1, tzinfo=pytz.UTC),
+                available_for_purchase_at=None,
             ),
             ProductChannelListing(
                 product=products[1],
                 channel=channel_USD,
                 is_published=True,
                 discounted_price_amount=Decimal(15),
-                publication_date=datetime.date(2000, 1, 1),
+                published_at=datetime.datetime(2000, 1, 1, tzinfo=pytz.UTC),
+                available_for_purchase_at=datetime.datetime(
+                    2003, 1, 1, tzinfo=pytz.UTC
+                ),
             ),
             ProductChannelListing(
                 product=products[2],
                 channel=channel_USD,
                 is_published=False,
                 discounted_price_amount=Decimal(4),
-                publication_date=datetime.date(1999, 1, 1),
+                published_at=datetime.datetime(1999, 1, 1, tzinfo=pytz.UTC),
+                available_for_purchase_at=datetime.datetime(
+                    2000, 1, 1, tzinfo=pytz.UTC
+                ),
             ),
             ProductChannelListing(
                 product=products[3],
                 channel=channel_USD,
                 is_published=True,
+                visible_in_listings=True,
                 discounted_price_amount=Decimal(7),
-                publication_date=datetime.date(2001, 1, 1),
+                published_at=datetime.datetime(2001, 1, 1, tzinfo=pytz.UTC),
+                available_for_purchase_at=datetime.datetime(
+                    2001, 1, 1, tzinfo=pytz.UTC
+                ),
             ),
             # Second channel
             ProductChannelListing(
@@ -92,28 +105,39 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 channel=channel_PLN,
                 is_published=False,
                 discounted_price_amount=Decimal(15),
-                publication_date=datetime.date(2003, 1, 1),
+                published_at=datetime.datetime(2003, 1, 1, tzinfo=pytz.UTC),
+                available_for_purchase_at=datetime.datetime(
+                    2003, 1, 1, tzinfo=pytz.UTC
+                ),
             ),
             ProductChannelListing(
                 product=products[1],
                 channel=channel_PLN,
                 is_published=True,
                 discounted_price_amount=Decimal(4),
-                publication_date=datetime.date(1999, 1, 1),
+                published_at=datetime.datetime(1999, 1, 1, tzinfo=pytz.UTC),
+                available_for_purchase_at=datetime.datetime(
+                    2002, 1, 1, tzinfo=pytz.UTC
+                ),
             ),
             ProductChannelListing(
                 product=products[2],
                 channel=channel_PLN,
                 is_published=True,
                 discounted_price_amount=Decimal(5),
-                publication_date=datetime.date(2000, 1, 1),
+                published_at=datetime.datetime(2000, 1, 1, tzinfo=pytz.UTC),
+                available_for_purchase_at=None,
             ),
             ProductChannelListing(
                 product=products[4],
                 channel=channel_PLN,
                 is_published=True,
+                visible_in_listings=True,
                 discounted_price_amount=Decimal(7),
-                publication_date=datetime.date(1998, 1, 1),
+                published_at=datetime.datetime(1998, 1, 1, tzinfo=pytz.UTC),
+                available_for_purchase_at=datetime.datetime(
+                    2000, 1, 1, tzinfo=pytz.UTC
+                ),
             ),
         ]
     )
@@ -123,26 +147,31 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
                 product=products[0],
                 sku=str(uuid.uuid4()).replace("-", ""),
                 track_inventory=True,
+                name="XS",
             ),
             ProductVariant(
                 product=products[1],
                 sku=str(uuid.uuid4()).replace("-", ""),
                 track_inventory=True,
+                name="S",
             ),
             ProductVariant(
                 product=products[2],
                 sku=str(uuid.uuid4()).replace("-", ""),
                 track_inventory=True,
+                name="M",
             ),
             ProductVariant(
                 product=products[3],
                 sku=str(uuid.uuid4()).replace("-", ""),
                 track_inventory=True,
+                name="L",
             ),
             ProductVariant(
                 product=products[4],
                 sku=str(uuid.uuid4()).replace("-", ""),
                 track_inventory=True,
+                name="XL",
             ),
         ]
     )
@@ -199,6 +228,19 @@ def products_for_sorting_with_channels(category, channel_USD, channel_PLN):
             ),
         ]
     )
+
+    products[3].save()
+    products[4].save()
+    products[0].save()
+    products[2].save()
+    products[1].save()
+
+    variants[2].save()
+    variants[0].save()
+    variants[4].save()
+    variants[1].save()
+    variants[3].save()
+
     return products
 
 
@@ -224,7 +266,7 @@ QUERY_PRODUCTS_WITH_SORTING_AND_FILTERING = """
         {"field": "PUBLISHED", "direction": "ASC"},
         {"field": "PRICE", "direction": "DESC"},
         {"field": "MINIMAL_PRICE", "direction": "DESC"},
-        {"field": "PUBLICATION_DATE", "direction": "DESC"},
+        {"field": "PUBLISHED_AT", "direction": "DESC"},
     ],
 )
 def test_products_with_sorting_and_without_channel(
@@ -282,6 +324,22 @@ def test_products_with_sorting_and_without_channel(
             {"field": "PUBLICATION_DATE", "direction": "DESC"},
             ["Product1", "Product2", "ProductProduct1", "ProductProduct2"],
         ),
+        (
+            {"field": "PUBLISHED_AT", "direction": "ASC"},
+            ["ProductProduct2", "ProductProduct1", "Product2", "Product1"],
+        ),
+        (
+            {"field": "PUBLISHED_AT", "direction": "DESC"},
+            ["Product1", "Product2", "ProductProduct1", "ProductProduct2"],
+        ),
+        (
+            {"field": "LAST_MODIFIED_AT", "direction": "ASC"},
+            ["Product2", "Product1", "ProductProduct2", "ProductProduct1"],
+        ),
+        (
+            {"field": "LAST_MODIFIED_AT", "direction": "DESC"},
+            ["ProductProduct1", "ProductProduct2", "Product1", "Product2"],
+        ),
     ],
 )
 def test_products_with_sorting_and_channel_USD(
@@ -336,6 +394,30 @@ def test_products_with_sorting_and_channel_USD(
         (
             {"field": "MINIMAL_PRICE", "direction": "DESC"},
             ["Product1", "Product3", "ProductProduct2", "ProductProduct1"],
+        ),
+        (
+            {"field": "PUBLICATION_DATE", "direction": "ASC"},
+            ["Product3", "ProductProduct1", "ProductProduct2", "Product1"],
+        ),
+        (
+            {"field": "PUBLICATION_DATE", "direction": "DESC"},
+            ["Product1", "ProductProduct2", "ProductProduct1", "Product3"],
+        ),
+        (
+            {"field": "PUBLISHED_AT", "direction": "ASC"},
+            ["Product3", "ProductProduct1", "ProductProduct2", "Product1"],
+        ),
+        (
+            {"field": "PUBLISHED_AT", "direction": "DESC"},
+            ["Product1", "ProductProduct2", "ProductProduct1", "Product3"],
+        ),
+        (
+            {"field": "LAST_MODIFIED_AT", "direction": "ASC"},
+            ["Product3", "Product1", "ProductProduct2", "ProductProduct1"],
+        ),
+        (
+            {"field": "LAST_MODIFIED_AT", "direction": "DESC"},
+            ["ProductProduct1", "ProductProduct2", "Product1", "Product3"],
         ),
     ],
 )
@@ -454,10 +536,19 @@ def test_products_with_filtering_without_channel(
     [
         ({"isPublished": True}, 3),
         ({"isPublished": False}, 1),
+        ({"isAvailable": True}, 3),
+        ({"isAvailable": False}, 1),
+        ({"publishedFrom": "2001-01-01T00:00:00+00:00"}, 3),
+        ({"availableFrom": "2001-01-01T00:00:00+00:00"}, 2),
+        ({"isVisibleInListing": True}, 1),
+        ({"isVisibleInListing": False}, 3),
         ({"price": {"lte": 8}}, 2),
         ({"price": {"gte": 11}}, 1),
         ({"minimalPrice": {"lte": 4}}, 1),
         ({"minimalPrice": {"gte": 5}}, 3),
+        ({"slugs": ["prod1"]}, 1),
+        ({"slugs": ["prod_prod1", "prod_prod2"]}, 2),
+        ({"slugs": []}, 4),
     ],
 )
 def test_products_with_filtering_with_channel_USD(
@@ -490,6 +581,12 @@ def test_products_with_filtering_with_channel_USD(
     [
         ({"isPublished": True}, 3),
         ({"isPublished": False}, 1),
+        ({"isAvailable": True}, 3),
+        ({"isAvailable": False}, 1),
+        ({"publishedFrom": "2001-01-01T00:00:00+00:00"}, 3),
+        ({"availableFrom": "2001-01-01T00:00:00+00:00"}, 1),
+        ({"isVisibleInListing": True}, 1),
+        ({"isVisibleInListing": False}, 3),
         ({"price": {"lte": 8}}, 2),
         ({"price": {"gte": 11}}, 1),
         ({"minimalPrice": {"lte": 4}}, 1),
@@ -526,10 +623,17 @@ def test_products_with_filtering_with_channel_PLN(
     [
         {"isPublished": True},
         {"isPublished": False},
+        {"isAvailable": True},
+        {"isAvailable": False},
+        {"publishedFrom": "2001-01-01T00:00:00+00:00"},
+        {"availableFrom": "2001-01-01T00:00:00+00:00"},
+        {"isVisibleInListing": True},
+        {"isVisibleInListing": False},
         {"price": {"lte": 8}},
         {"price": {"gte": 11}},
         {"minimalPrice": {"lte": 4}},
         {"minimalPrice": {"gte": 5}},
+        {"slugs": ["prod1"]},
     ],
 )
 def test_products_with_filtering_and_not_existing_channel(
@@ -578,3 +682,150 @@ def test_published_products_without_sku_as_staff(
     content = get_graphql_content(response)
     products_nodes = content["data"]["products"]["edges"]
     assert len(products_nodes) == 3
+
+
+@pytest.mark.parametrize(
+    "products_filter, count",
+    [
+        ({"updatedAt": {"gte": "2012-01-14T10:59:00+00:00"}}, 2),
+        ({"updatedAt": {"lte": "2012-01-14T12:00:05+00:00"}}, 2),
+        ({"updatedAt": {"gte": "2012-01-14T11:59:00+00:00"}}, 1),
+        ({"updatedAt": {"lte": "2012-01-14T11:05:00+00:00"}}, 1),
+        ({"updatedAt": {"gte": "2012-01-14T12:01:00+00:00"}}, 0),
+        ({"updatedAt": {"lte": "2012-01-14T10:59:00+00:00"}}, 0),
+        (
+            {
+                "updatedAt": {
+                    "lte": "2012-01-14T12:01:00+00:00",
+                    "gte": "2012-01-14T11:59:00+00:00",
+                },
+            },
+            1,
+        ),
+    ],
+)
+def test_product_query_with_filter_updated_at(
+    products_filter,
+    count,
+    product_type,
+    category,
+    staff_api_client,
+    permission_manage_products,
+):
+    with freeze_time("2012-01-14 11:00:00"):
+        Product.objects.create(
+            name="Product1",
+            slug="prod1",
+            category=category,
+            product_type=product_type,
+        )
+
+    with freeze_time("2012-01-14 12:00:00"):
+        Product.objects.create(
+            name="Product2",
+            slug="prod2",
+            category=category,
+            product_type=product_type,
+        )
+
+    variables = {"filter": products_filter}
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    response = staff_api_client.post_graphql(
+        QUERY_PRODUCTS_WITH_SORTING_AND_FILTERING, variables
+    )
+    content = get_graphql_content(response)
+    variants = content["data"]["products"]["edges"]
+
+    assert len(variants) == count
+
+
+GET_SORTED_VARIANTS_QUERY = """
+query Variants($sortBy: ProductVariantSortingInput, $channel: String) {
+    productVariants(first: 10, sortBy: $sortBy, channel: $channel) {
+      edges {
+        node {
+          name
+        }
+      }
+    }
+}
+"""
+
+
+@pytest.mark.parametrize(
+    "sort_by, variants_order",
+    [
+        (
+            {"field": "LAST_MODIFIED_AT", "direction": "ASC"},
+            ["M", "XS", "S", "L"],
+        ),
+        (
+            {"field": "LAST_MODIFIED_AT", "direction": "DESC"},
+            ["L", "S", "XS", "M"],
+        ),
+    ],
+)
+def test_products_variants_with_sorting_and_channel_USD(
+    sort_by,
+    variants_order,
+    staff_api_client,
+    permission_manage_products,
+    products_for_sorting_with_channels,
+    channel_USD,
+):
+    # given
+    variables = {"sortBy": sort_by, "channel": channel_USD.slug}
+
+    # when
+    response = staff_api_client.post_graphql(
+        GET_SORTED_VARIANTS_QUERY,
+        variables,
+        permissions=[permission_manage_products],
+        check_no_permissions=False,
+    )
+
+    # then
+    content = get_graphql_content(response)
+    products_nodes = content["data"]["productVariants"]["edges"]
+    for index, product_name in enumerate(variants_order):
+        assert product_name == products_nodes[index]["node"]["name"]
+
+
+@pytest.mark.parametrize(
+    "sort_by, variants_order",
+    [
+        (
+            {"field": "LAST_MODIFIED_AT", "direction": "ASC"},
+            ["M", "XS", "XL", "S"],
+        ),
+        (
+            {"field": "LAST_MODIFIED_AT", "direction": "DESC"},
+            ["S", "XL", "XS", "M"],
+        ),
+    ],
+)
+def test_products_variants_with_sorting_and_channel_PLN(
+    sort_by,
+    variants_order,
+    staff_api_client,
+    permission_manage_products,
+    products_for_sorting_with_channels,
+    channel_PLN,
+):
+    # given
+    variables = {"sortBy": sort_by, "channel": channel_PLN.slug}
+
+    # when
+    response = staff_api_client.post_graphql(
+        GET_SORTED_VARIANTS_QUERY,
+        variables,
+        permissions=[permission_manage_products],
+        check_no_permissions=False,
+    )
+
+    # then
+    content = get_graphql_content(response)
+    products_nodes = content["data"]["productVariants"]["edges"]
+    for index, product_name in enumerate(variants_order):
+        assert product_name == products_nodes[index]["node"]["name"]

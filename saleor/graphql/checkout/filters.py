@@ -2,15 +2,19 @@ from uuid import UUID
 
 import django_filters
 from django.db.models import Exists, OuterRef, Q
-from graphene_django.filter import GlobalIDMultipleChoiceFilter
 
 from ...account.models import User
 from ...checkout.models import Checkout
 from ...payment.models import Payment
 from ..channel.types import Channel
-from ..core.filters import MetadataFilterBase, ObjectTypeFilter
-from ..core.types import FilterInputObjectType
-from ..core.types.common import DateRangeInput
+from ..core.filters import (
+    GlobalIDMultipleChoiceFilter,
+    ListObjectTypeFilter,
+    MetadataFilter,
+    MetadataFilterBase,
+    ObjectTypeFilter,
+)
+from ..core.types import DateRangeInput, FilterInputObjectType
 from ..core.utils import from_global_id_or_error
 from ..utils import resolve_global_ids_to_primary_keys
 from ..utils.filters import filter_range_field
@@ -32,6 +36,13 @@ def get_payment_id_from_query(value):
         return None
 
 
+def get_checkout_id_from_query(value):
+    try:
+        return from_global_id_or_error(value, only_type="Checkout")[1]
+    except Exception:
+        return None
+
+
 def filter_checkout_by_payment(qs, payment_id):
     if payment_id:
         payments = Payment.objects.filter(pk=payment_id).values("id")
@@ -40,7 +51,7 @@ def filter_checkout_by_payment(qs, payment_id):
 
 
 def filter_created_range(qs, _, value):
-    return filter_range_field(qs, "created__date", value)
+    return filter_range_field(qs, "created_at__date", value)
 
 
 def filter_customer(qs, _, value):
@@ -68,7 +79,9 @@ def filter_checkout_search(qs, _, value):
 
     filter_option = Q(Exists(users.filter(id=OuterRef("user_id"))))
 
-    if checkout_id := get_checkout_token_from_query(value):
+    possible_token = get_checkout_id_from_query(value) or value
+
+    if checkout_id := get_checkout_token_from_query(possible_token):
         filter_option |= Q(token=checkout_id)
 
     payments = Payment.objects.filter(psp_reference=value).values("id")
@@ -77,11 +90,27 @@ def filter_checkout_search(qs, _, value):
     return qs.filter(filter_option)
 
 
+def filter_checkout_metadata(qs, _, value):
+    for metadata_item in value:
+        if metadata_item.value:
+            qs = qs.filter(
+                metadata_storage__metadata__contains={
+                    metadata_item.key: metadata_item.value
+                }
+            )
+        else:
+            qs = qs.filter(metadata_storage__metadata__has_key=metadata_item.key)
+    return qs
+
+
 class CheckoutFilter(MetadataFilterBase):
     customer = django_filters.CharFilter(method=filter_customer)
     created = ObjectTypeFilter(input_class=DateRangeInput, method=filter_created_range)
     search = django_filters.CharFilter(method=filter_checkout_search)
     channels = GlobalIDMultipleChoiceFilter(method=filter_channels)
+    metadata = ListObjectTypeFilter(
+        input_class=MetadataFilter, method=filter_checkout_metadata
+    )
 
     class Meta:
         model = Checkout

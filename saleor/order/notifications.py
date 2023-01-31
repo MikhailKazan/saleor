@@ -10,9 +10,11 @@ from ..core.notify_events import NotifyEventType
 from ..core.prices import quantize_price, quantize_price_fields
 from ..core.utils.url import prepare_url
 from ..discount import OrderDiscountType
+from ..graphql.core.utils import to_global_id_or_none
 from ..product import ProductMediaTypes
 from ..product.models import DigitalContentUrl, Product, ProductMedia, ProductVariant
-from ..product.product_images import AVAILABLE_PRODUCT_SIZES, get_thumbnail
+from ..thumbnail import THUMBNAIL_SIZES
+from ..thumbnail.utils import get_image_or_proxy_url
 from .models import FulfillmentLine, Order, OrderLine
 
 if TYPE_CHECKING:
@@ -21,10 +23,14 @@ if TYPE_CHECKING:
 
 
 def get_image_payload(instance: ProductMedia):
-    image_file = instance.image if instance else None
     return {
-        size: get_thumbnail(image_file, size, "thumbnail")
-        for size in AVAILABLE_PRODUCT_SIZES
+        # This is temporary solution, the get_product_image_thumbnail_url
+        # should be optimize - we should fetch all thumbnails at once instead of
+        # fetching thumbnails by one for each size
+        str(size): get_image_or_proxy_url(
+            None, str(instance.id), "ProductMedia", size, None
+        )
+        for size in THUMBNAIL_SIZES
     }
 
 
@@ -53,12 +59,12 @@ def get_product_attributes(product):
                 },
                 "values": [
                     {
-                        "name": value.get("name"),
-                        "value": value.get("value"),
-                        "slug": value.get("slug"),
-                        "file_url": value.get("file_url"),
+                        "name": value.name,
+                        "value": value.value,
+                        "slug": value.slug,
+                        "file_url": value.file_url,
                     }
-                    for value in attr.values.values("name", "value", "slug", "file_url")
+                    for value in attr.values.all()
                 ],
             }
         )
@@ -69,7 +75,7 @@ def get_product_payload(product: Product):
     all_media = product.media.all()
     images = [media for media in all_media if media.type == ProductMediaTypes.IMAGE]
     return {
-        "id": product.id,
+        "id": to_global_id_or_none(product),
         "attributes": get_product_attributes(product),
         "weight": str(product.weight or ""),
         **get_default_images_payload(images),
@@ -80,7 +86,7 @@ def get_product_variant_payload(variant: ProductVariant):
     all_media = variant.media.all()
     images = [media for media in all_media if media.type == ProductMediaTypes.IMAGE]
     return {
-        "id": variant.id,
+        "id": to_global_id_or_none(variant),
         "weight": str(variant.weight or ""),
         "is_preorder": variant.is_preorder_active(),
         "preorder_global_threshold": variant.preorder_global_threshold,
@@ -90,10 +96,10 @@ def get_product_variant_payload(variant: ProductVariant):
 
 
 def get_order_line_payload(line: "OrderLine"):
-    digital_url = ""
+    digital_url: Optional[str] = None
     if line.is_digital:
         content = DigitalContentUrl.objects.filter(line=line).first()
-        digital_url = content.get_absolute_url() if content else None  # type: ignore
+        digital_url = content.get_absolute_url() if content else None
     variant_dependent_fields = {}
     if line.variant:
         variant_dependent_fields = {
@@ -103,12 +109,12 @@ def get_order_line_payload(line: "OrderLine"):
     currency = line.currency
 
     return {
-        "id": line.id,
-        "product": variant_dependent_fields.get("product"),  # type: ignore
+        "id": to_global_id_or_none(line),
+        "product": variant_dependent_fields.get("product"),
         "product_name": line.product_name,
         "translated_product_name": line.translated_product_name or line.product_name,
         "variant_name": line.variant_name,
-        "variant": variant_dependent_fields.get("variant"),  # type: ignore
+        "variant": variant_dependent_fields.get("variant"),
         "translated_variant_name": line.translated_variant_name or line.variant_name,
         "product_sku": line.product_sku,
         "product_variant_id": line.product_variant_id,
@@ -131,6 +137,7 @@ def get_order_line_payload(line: "OrderLine"):
         "unit_discount_reason": line.unit_discount_reason,
         "unit_discount_type": line.unit_discount_type,
         "unit_discount_amount": line.unit_discount_amount,
+        "metadata": line.metadata,
     }
 
 
@@ -193,8 +200,6 @@ def get_discounts_payload(order):
 
 
 ORDER_MODEL_FIELDS = [
-    "id",
-    "token",
     "display_gross_prices",
     "currency",
     "total_gross_amount",
@@ -243,9 +248,11 @@ def get_default_order_payload(order: "Order", redirect_url: str = ""):
     order_payload = model_to_dict(order, fields=ORDER_MODEL_FIELDS)
     order_payload.update(
         {
-            "number": order.id,
+            "id": to_global_id_or_none(order),
+            "token": order.id,  # DEPRECATED: will be removed in Saleor 4.0.
+            "number": order.number,
             "channel_slug": order.channel.slug,
-            "created": str(order.created),
+            "created": str(order.created_at),
             "shipping_price_net_amount": order.shipping_price_net_amount,
             "shipping_price_gross_amount": order.shipping_price_gross_amount,
             "order_details_url": order_details_url,
@@ -261,12 +268,15 @@ def get_default_order_payload(order: "Order", redirect_url: str = ""):
             **get_discounts_payload(order),
         }
     )
+    # Deprecated: override private_metadata with empty dict as it shouldn't be returned
+    # in the payload (see SALEOR-7046). Should be removed in Saleor 4.0.
+    order_payload["private_metadata"] = {}
     return order_payload
 
 
 def get_default_fulfillment_line_payload(line: "FulfillmentLine"):
     return {
-        "id": line.id,
+        "id": to_global_id_or_none(line),
         "order_line": get_order_line_payload(line.order_line),
         "quantity": line.quantity,
     }
@@ -296,7 +306,7 @@ def get_default_fulfillment_payload(order, fulfillment):
 
 
 def prepare_order_details_url(order: Order, redirect_url: str) -> str:
-    params = urlencode({"token": order.token})
+    params = urlencode({"token": order.id})
     return prepare_url(params, redirect_url)
 
 
@@ -369,8 +379,8 @@ def send_payment_confirmation(order_info, manager):
         "order": get_default_order_payload(order_info.order),
         "recipient_email": order_info.customer_email,
         "payment": {
-            "created": payment.created,
-            "modified": payment.modified,
+            "created": payment.created_at,
+            "modified": payment.modified_at,
             "charge_status": payment.charge_status,
             "total": quantize_price(payment.total, payment_currency),
             "captured_amount": quantize_price(
@@ -427,5 +437,5 @@ def send_order_refunded_confirmation(
 def attach_requester_payload_data(
     payload: dict, user: Optional["User"], app: Optional["App"]
 ):
-    payload["requester_user_id"] = user.id if user else None
-    payload["requester_app_id"] = app.id if app else None
+    payload["requester_user_id"] = to_global_id_or_none(user) if user else None
+    payload["requester_app_id"] = to_global_id_or_none(app) if app else None

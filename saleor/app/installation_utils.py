@@ -1,12 +1,34 @@
 import requests
+from django.conf import settings
 from django.contrib.sites.models import Site
+from django.urls import reverse
+from requests import HTTPError, Response
 
-from ..core.permissions import get_permission_names
+from ..app.headers import AppHeaders, DeprecatedAppHeaders
+from ..core.utils import build_absolute_uri
+from ..permission.enums import get_permission_names
+from ..plugins.manager import PluginsManager
+from ..webhook.models import Webhook, WebhookEvent
 from .manifest_validations import clean_manifest_data
 from .models import App, AppExtension, AppInstallation
-from .types import AppType
+from .types import AppExtensionTarget, AppType
 
 REQUEST_TIMEOUT = 25
+
+
+class AppInstallationError(HTTPError):
+    pass
+
+
+def validate_app_install_response(response: Response):
+    try:
+        response.raise_for_status()
+    except HTTPError as err:
+        try:
+            error_msg = str(response.json()["error"]["message"])
+        except Exception:
+            raise err
+        raise AppInstallationError(error_msg, response=response)
 
 
 def send_app_token(target_url: str, token: str):
@@ -14,20 +36,18 @@ def send_app_token(target_url: str, token: str):
     headers = {
         "Content-Type": "application/json",
         # X- headers will be deprecated in Saleor 4.0, proper headers are without X-
-        "x-saleor-domain": domain,
-        "saleor-domain": domain,
+        DeprecatedAppHeaders.DOMAIN: domain,
+        AppHeaders.DOMAIN: domain,
+        AppHeaders.API_URL: build_absolute_uri(reverse("api"), domain),
     }
     json_data = {"auth_token": token}
     response = requests.post(
         target_url, json=json_data, headers=headers, timeout=REQUEST_TIMEOUT
     )
-    response.raise_for_status()
+    validate_app_install_response(response)
 
 
-def install_app(
-    app_installation: AppInstallation,
-    activate: bool = False,
-):
+def install_app(app_installation: AppInstallation, activate: bool = False):
     response = requests.get(app_installation.manifest_url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     assigned_permissions = app_installation.permissions.all()
@@ -49,7 +69,9 @@ def install_app(
         configuration_url=manifest_data.get("configurationUrl"),
         app_url=manifest_data.get("appUrl"),
         version=manifest_data.get("version"),
+        manifest_url=app_installation.manifest_url,
         type=AppType.THIRDPARTY,
+        audience=manifest_data.get("audience"),
     )
     app.permissions.set(app_installation.permissions.all())
     for extension_data in manifest_data.get("extensions", []):
@@ -57,19 +79,37 @@ def install_app(
             app=app,
             label=extension_data.get("label"),
             url=extension_data.get("url"),
-            view=extension_data.get("view"),
-            type=extension_data.get("type"),
-            target=extension_data.get("target"),
+            mount=extension_data.get("mount"),
+            target=extension_data.get("target", AppExtensionTarget.POPUP),
         )
         extension.permissions.set(extension_data.get("permissions", []))
 
-    token = app.tokens.create(name="Default token")
+    webhooks = Webhook.objects.bulk_create(
+        Webhook(
+            app=app,
+            name=webhook["name"],
+            target_url=webhook["targetUrl"],
+            subscription_query=webhook["query"],
+        )
+        for webhook in manifest_data.get("webhooks", [])
+    )
+
+    webhook_events = []
+    for db_webhook, manifest_webhook in zip(
+        webhooks, manifest_data.get("webhooks", [])
+    ):
+        for event_type in manifest_webhook["events"]:
+            webhook_events.append(
+                WebhookEvent(webhook=db_webhook, event_type=event_type)
+            )
+    WebhookEvent.objects.bulk_create(webhook_events)
+
+    _, token = app.tokens.create(name="Default token")  # type: ignore[call-arg] # calling create on a related manager # noqa: E501
 
     try:
-        send_app_token(
-            target_url=manifest_data.get("tokenTargetUrl"), token=token.auth_token
-        )
+        send_app_token(target_url=manifest_data.get("tokenTargetUrl"), token=token)
     except requests.RequestException as e:
         app.delete()
         raise e
-    return app
+    PluginsManager(plugins=settings.PLUGINS).app_installed(app)
+    return app, token

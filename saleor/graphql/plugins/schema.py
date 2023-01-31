@@ -1,10 +1,11 @@
 import graphene
 
-from ...core.permissions import PluginsPermissions
-from ...core.tracing import traced_resolver
+from ...permission.enums import PluginsPermissions
+from ..core import ResolveInfo
 from ..core.connection import create_connection_slice
-from ..core.fields import ConnectionField
-from ..decorators import permission_required
+from ..core.fields import ConnectionField, PermissionsField
+from ..core.tracing import traced_resolver
+from .dataloaders import plugin_manager_promise_callback
 from .filters import PluginFilterInput
 from .mutations import PluginUpdate
 from .resolvers import resolve_plugin, resolve_plugins
@@ -13,12 +14,15 @@ from .types import Plugin, PluginCountableConnection
 
 
 class PluginsQueries(graphene.ObjectType):
-    plugin = graphene.Field(
+    plugin = PermissionsField(
         Plugin,
         id=graphene.Argument(
             graphene.ID, description="ID of the plugin.", required=True
         ),
         description="Look up a plugin by ID.",
+        permissions=[
+            PluginsPermissions.MANAGE_PLUGINS,
+        ],
     )
 
     plugins = ConnectionField(
@@ -26,17 +30,22 @@ class PluginsQueries(graphene.ObjectType):
         filter=PluginFilterInput(description="Filtering options for plugins."),
         sort_by=PluginSortingInput(description="Sort plugins."),
         description="List of plugins.",
+        permissions=[
+            PluginsPermissions.MANAGE_PLUGINS,
+        ],
     )
 
-    @permission_required(PluginsPermissions.MANAGE_PLUGINS)
+    @staticmethod
     @traced_resolver
-    def resolve_plugin(self, info, **data):
-        return resolve_plugin(data.get("id"), info.context.plugins)
+    @plugin_manager_promise_callback
+    def resolve_plugin(_root, _info: ResolveInfo, manager, **data):
+        return resolve_plugin(data.get("id"), manager)
 
-    @permission_required(PluginsPermissions.MANAGE_PLUGINS)
+    @staticmethod
     @traced_resolver
-    def resolve_plugins(self, info, **kwargs):
-        qs = resolve_plugins(info.context.plugins, **kwargs)
+    @plugin_manager_promise_callback
+    def resolve_plugins(_root, info: ResolveInfo, manager, **kwargs):
+        qs = resolve_plugins(manager, **kwargs)
         return create_connection_slice(qs, info, kwargs, PluginCountableConnection)
 
 

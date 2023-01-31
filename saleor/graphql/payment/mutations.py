@@ -1,60 +1,73 @@
-from typing import TYPE_CHECKING, List
+import uuid
+from decimal import Decimal
+from typing import Dict, List, Optional, Union
 
 import graphene
 from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models import F, Model
 
 from ...channel.models import Channel
+from ...checkout import models as checkout_models
 from ...checkout.calculations import calculate_checkout_total_with_gift_cards
 from ...checkout.checkout_cleaner import clean_billing_address, clean_checkout_shipping
 from ...checkout.fetch import fetch_checkout_info, fetch_checkout_lines
 from ...checkout.utils import cancel_active_payments
 from ...core.error_codes import MetadataErrorCode
-from ...core.permissions import OrderPermissions
 from ...core.utils import get_client_ip
 from ...core.utils.url import validate_storefront_url
-from ...payment import PaymentError, StorePaymentMethod, gateway
-from ...payment.error_codes import PaymentErrorCode
+from ...order import models as order_models
+from ...order.events import transaction_event as order_transaction_event
+from ...order.models import Order
+from ...payment import PaymentError, StorePaymentMethod, TransactionAction, gateway
+from ...payment import models as payment_models
+from ...payment.error_codes import (
+    PaymentErrorCode,
+    TransactionCreateErrorCode,
+    TransactionRequestActionErrorCode,
+    TransactionUpdateErrorCode,
+)
+from ...payment.gateway import (
+    request_charge_action,
+    request_refund_action,
+    request_void_action,
+)
 from ...payment.utils import create_payment, is_currency_supported
+from ...permission.enums import OrderPermissions, PaymentPermissions
 from ..account.i18n import I18nMixin
+from ..app.dataloaders import get_app_promise
 from ..channel.utils import validate_channel
-from ..checkout.mutations import get_checkout_by_token
+from ..checkout.mutations.utils import get_checkout
 from ..checkout.types import Checkout
-from ..core.descriptions import ADDED_IN_31, DEPRECATED_IN_3X_INPUT
-from ..core.enums import to_enum
+from ..core import ResolveInfo
+from ..core.descriptions import (
+    ADDED_IN_31,
+    ADDED_IN_34,
+    DEPRECATED_IN_3X_INPUT,
+    PREVIEW_FEATURE,
+)
+from ..core.fields import JSONString
 from ..core.mutations import BaseMutation
 from ..core.scalars import UUID, PositiveDecimal
 from ..core.types import common as common_types
-from ..core.validators import validate_one_of_args_is_in_mutation
+from ..discount.dataloaders import load_discounts
 from ..meta.mutations import MetadataInput
-from .types import Payment, PaymentInitialized
+from ..plugins.dataloaders import get_plugin_manager_promise
+from ..utils import get_user_or_app_from_context
+from .enums import StorePaymentMethodEnum, TransactionActionEnum, TransactionStatusEnum
+from .types import Payment, PaymentInitialized, TransactionItem
 from .utils import metadata_contains_empty_key
 
-if TYPE_CHECKING:
-    from ...checkout import models as checkout_models
 
-
-def description(enum):
-    if enum is None:
-        return "Enum representing the type of a payment storage in a gateway."
-    elif enum == StorePaymentMethodEnum.NONE:
-        return "Storage is disabled. The payment is not stored."
-    elif enum == StorePaymentMethodEnum.ON_SESSION:
-        return (
-            "On session storage type. "
-            "The payment is stored only to be reused when "
-            "the customer is present in the checkout flow."
-        )
-    elif enum == StorePaymentMethodEnum.OFF_SESSION:
-        return (
-            "Off session storage type. "
-            "The payment is stored to be reused even if the customer is absent."
-        )
-    return None
-
-
-StorePaymentMethodEnum = to_enum(
-    StorePaymentMethod, type_name="StorePaymentMethodEnum", description=description
-)
+def add_to_order_total_authorized_and_total_charged(
+    order_id: uuid.UUID,
+    authorized_amount_to_add: Decimal,
+    charged_amount_to_add: Decimal,
+):
+    Order.objects.filter(id=order_id).update(
+        total_authorized_amount=F("total_authorized_amount") + authorized_amount_to_add,
+        total_charged_amount=F("total_charged_amount") + charged_amount_to_add,
+    )
 
 
 class PaymentInput(graphene.InputObjectType):
@@ -87,13 +100,13 @@ class PaymentInput(graphene.InputObjectType):
         ),
     )
     store_payment_method = StorePaymentMethodEnum(
-        description=f"{ADDED_IN_31} Payment store type.",
+        description="Payment store type." + ADDED_IN_31,
         required=False,
-        default_value=StorePaymentMethod.NONE,
+        default_value=StorePaymentMethodEnum.NONE.name,
     )
-    metadata = graphene.List(
-        graphene.NonNull(MetadataInput),
-        description=f"{ADDED_IN_31} User public metadata.",
+    metadata = common_types.NonNullList(
+        MetadataInput,
+        description="User public metadata." + ADDED_IN_31,
         required=False,
     )
 
@@ -103,13 +116,20 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
     payment = graphene.Field(Payment, description="A newly created payment.")
 
     class Arguments:
-        checkout_id = graphene.ID(
-            description=(
-                f"The ID of the checkout. {DEPRECATED_IN_3X_INPUT} Use token instead."
-            ),
+        id = graphene.ID(
+            description="The checkout's ID." + ADDED_IN_34,
             required=False,
         )
-        token = UUID(description="Checkout token.", required=False)
+        token = UUID(
+            description=f"Checkout token.{DEPRECATED_IN_3X_INPUT} Use `id` instead.",
+            required=False,
+        )
+        checkout_id = graphene.ID(
+            required=False,
+            description=(
+                f"The ID of the checkout. {DEPRECATED_IN_3X_INPUT} Use `id` instead."
+            ),
+        )
         input = PaymentInput(
             description="Data required to create a new payment.", required=True
         )
@@ -120,35 +140,45 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
         error_type_field = "payment_errors"
 
     @classmethod
-    def clean_payment_amount(cls, info, checkout_total, amount):
+    def clean_payment_amount(cls, info: ResolveInfo, checkout_total, amount):
         if amount != checkout_total.gross.amount:
             raise ValidationError(
                 {
                     "amount": ValidationError(
                         "Partial payments are not allowed, amount should be "
                         "equal checkout's total.",
-                        code=PaymentErrorCode.PARTIAL_PAYMENT_NOT_ALLOWED,
+                        code=PaymentErrorCode.PARTIAL_PAYMENT_NOT_ALLOWED.value,
                     )
                 }
             )
 
     @classmethod
-    def validate_gateway(cls, manager, gateway_id, currency):
+    def validate_gateway(cls, manager, gateway_id, checkout):
         """Validate if given gateway can be used for this checkout.
 
-        Check if provided gateway_id is on the list of available payment gateways.
-        Gateway will be rejected if gateway_id is invalid or a gateway doesn't support
-        checkout's currency.
+        Check if provided gateway is active and CONFIGURATION_PER_CHANNEL is True.
+        If CONFIGURATION_PER_CHANNEL is False then check if gateway has
+        defined currency.
         """
-        if not is_currency_supported(currency, gateway_id, manager):
-            raise ValidationError(
-                {
-                    "gateway": ValidationError(
-                        f"The gateway {gateway_id} is not available for this checkout.",
-                        code=PaymentErrorCode.NOT_SUPPORTED_GATEWAY.value,
-                    )
-                }
-            )
+        payment_gateway = manager.get_plugin(gateway_id, checkout.channel.slug)
+
+        if not payment_gateway or not payment_gateway.active:
+            cls.raise_not_supported_gateway_error(gateway_id)
+
+        if not payment_gateway.CONFIGURATION_PER_CHANNEL:
+            if not is_currency_supported(checkout.currency, gateway_id, manager):
+                cls.raise_not_supported_gateway_error(gateway_id)
+
+    @classmethod
+    def raise_not_supported_gateway_error(cls, gateway_id: str):
+        raise ValidationError(
+            {
+                "gateway": ValidationError(
+                    f"The gateway {gateway_id} is not available for this checkout.",
+                    code=PaymentErrorCode.NOT_SUPPORTED_GATEWAY.value,
+                )
+            }
+        )
 
     @classmethod
     def validate_token(cls, manager, gateway: str, input_data: dict, channel_slug: str):
@@ -173,7 +203,7 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
             validate_storefront_url(return_url)
         except ValidationError as error:
             raise ValidationError(
-                {"redirect_url": error}, code=PaymentErrorCode.INVALID
+                {"redirect_url": error}, code=PaymentErrorCode.INVALID.value
             )
 
     @classmethod
@@ -201,36 +231,56 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
             )
 
     @classmethod
-    def perform_mutation(cls, _root, info, checkout_id=None, token=None, **data):
-        # DEPRECATED
-        validate_one_of_args_is_in_mutation(
-            PaymentErrorCode, "checkout_id", checkout_id, "token", token
-        )
-
-        if token:
-            checkout = get_checkout_by_token(token)
-        # DEPRECATED
-        else:
-            checkout = cls.get_node_or_error(
-                info, checkout_id or token, only_type=Checkout, field="checkout_id"
-            )
+    def perform_mutation(  # type: ignore[override]
+        cls,
+        _root,
+        info: ResolveInfo,
+        /,
+        *,
+        checkout_id=None,
+        id=None,
+        input,
+        token=None
+    ):
+        checkout = get_checkout(cls, info, checkout_id=checkout_id, token=token, id=id)
 
         cls.validate_checkout_email(checkout)
 
-        data = data["input"]
-        gateway = data["gateway"]
+        gateway = input["gateway"]
 
-        manager = info.context.plugins
-        cls.validate_gateway(manager, gateway, checkout.currency)
-        cls.validate_return_url(data)
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.validate_gateway(manager, gateway, checkout)
+        cls.validate_return_url(input)
 
-        lines = fetch_checkout_lines(checkout)
-        checkout_info = fetch_checkout_info(
-            checkout, lines, info.context.discounts, manager
-        )
+        lines, unavailable_variant_pks = fetch_checkout_lines(checkout)
+        if unavailable_variant_pks:
+            not_available_variants_ids = {
+                graphene.Node.to_global_id("ProductVariant", pk)
+                for pk in unavailable_variant_pks
+            }
+            raise ValidationError(
+                {
+                    "token": ValidationError(
+                        "Some of the checkout lines variants are unavailable.",
+                        code=PaymentErrorCode.UNAVAILABLE_VARIANT_IN_CHANNEL.value,
+                        params={"variants": not_available_variants_ids},
+                    )
+                }
+            )
+        if not lines:
+            raise ValidationError(
+                {
+                    "lines": ValidationError(
+                        "Cannot create payment for checkout without lines.",
+                        code=PaymentErrorCode.NO_CHECKOUT_LINES.value,
+                    )
+                }
+            )
+        discounts = load_discounts(info.context)
+        checkout_info = fetch_checkout_info(checkout, lines, discounts, manager)
 
         cls.validate_token(
-            manager, gateway, data, channel_slug=checkout_info.channel.slug
+            manager, gateway, input, channel_slug=checkout_info.channel.slug
         )
 
         address = (
@@ -241,9 +291,9 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
             checkout_info=checkout_info,
             lines=lines,
             address=address,
-            discounts=info.context.discounts,
+            discounts=discounts,
         )
-        amount = data.get("amount", checkout_total.gross.amount)
+        amount = input.get("amount", checkout_total.gross.amount)
         clean_checkout_shipping(checkout_info, lines, PaymentErrorCode)
         clean_billing_address(checkout_info, PaymentErrorCode)
         cls.clean_payment_amount(info, checkout_total, amount)
@@ -251,30 +301,54 @@ class CheckoutPaymentCreate(BaseMutation, I18nMixin):
             "customer_user_agent": info.context.META.get("HTTP_USER_AGENT"),
         }
 
-        cancel_active_payments(checkout)
-
-        metadata = data.get("metadata")
+        metadata = input.get("metadata")
 
         if metadata is not None:
             cls.validate_metadata_keys(metadata)
             metadata = {data.key: data.value for data in metadata}
 
-        payment = None
-        if amount != 0:
-            payment = create_payment(
-                gateway=gateway,
-                payment_token=data.get("token", ""),
-                total=amount,
-                currency=checkout.currency,
-                email=checkout.get_customer_email(),
-                extra_data=extra_data,
-                # FIXME this is not a customer IP address. It is a client storefront ip
-                customer_ip_address=get_client_ip(info.context),
-                checkout=checkout,
-                return_url=data.get("return_url"),
-                store_payment_method=data["store_payment_method"],
-                metadata=metadata,
+        # The payment creation and deactivation of old payments should happened in the
+        # transaction to avoid creating multiple active payments.
+        with transaction.atomic():
+            # The checkout lock is used to prevent processing checkout completion
+            # and new payment creation. This kind of case could result in the missing
+            # payments, that were created for the checkout that was already converted
+            # to an order.
+            checkout = (
+                checkout_models.Checkout.objects.select_for_update()
+                .filter(pk=checkout_info.checkout.pk)
+                .first()
             )
+
+            if not checkout:
+                raise ValidationError(
+                    "Checkout doesn't exist anymore.",
+                    code=PaymentErrorCode.NOT_FOUND.value,
+                )
+
+            cancel_active_payments(checkout)
+
+            payment = None
+            if amount != 0:
+                store_payment_method = (
+                    input.get("store_payment_method") or StorePaymentMethod.NONE
+                )
+
+                payment = create_payment(
+                    gateway=gateway,
+                    payment_token=input.get("token", ""),
+                    total=amount,
+                    currency=checkout.currency,
+                    email=checkout.get_customer_email(),
+                    extra_data=extra_data,
+                    # FIXME this is not a customer IP address.
+                    # It is a client storefront ip
+                    customer_ip_address=get_client_ip(info.context),
+                    checkout=checkout,
+                    return_url=input.get("return_url"),
+                    store_payment_method=store_payment_method,
+                    metadata=metadata,
+                )
 
         return CheckoutPaymentCreate(payment=payment, checkout=checkout)
 
@@ -293,7 +367,9 @@ class PaymentCapture(BaseMutation):
         error_type_field = "payment_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, payment_id, amount=None):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, amount=None, payment_id
+    ):
         payment = cls.get_node_or_error(
             info, payment_id, field="payment_id", only_type=Payment
         )
@@ -302,13 +378,17 @@ class PaymentCapture(BaseMutation):
             if payment.order
             else payment.checkout.channel.slug
         )
+        manager = get_plugin_manager_promise(info.context).get()
         try:
             gateway.capture(
-                payment, info.context.plugins, amount=amount, channel_slug=channel_slug
+                payment,
+                manager,
+                amount=amount,
+                channel_slug=channel_slug,
             )
             payment.refresh_from_db()
         except PaymentError as e:
-            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR)
+            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR.value)
         return PaymentCapture(payment=payment)
 
 
@@ -320,7 +400,9 @@ class PaymentRefund(PaymentCapture):
         error_type_field = "payment_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, payment_id, amount=None):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, amount=None, payment_id
+    ):
         payment = cls.get_node_or_error(
             info, payment_id, field="payment_id", only_type=Payment
         )
@@ -329,13 +411,17 @@ class PaymentRefund(PaymentCapture):
             if payment.order
             else payment.checkout.channel.slug
         )
+        manager = get_plugin_manager_promise(info.context).get()
         try:
             gateway.refund(
-                payment, info.context.plugins, amount=amount, channel_slug=channel_slug
+                payment,
+                manager,
+                amount=amount,
+                channel_slug=channel_slug,
             )
             payment.refresh_from_db()
         except PaymentError as e:
-            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR)
+            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR.value)
         return PaymentRefund(payment=payment)
 
 
@@ -352,7 +438,9 @@ class PaymentVoid(BaseMutation):
         error_type_field = "payment_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, payment_id):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, payment_id
+    ):
         payment = cls.get_node_or_error(
             info, payment_id, field="payment_id", only_type=Payment
         )
@@ -361,11 +449,12 @@ class PaymentVoid(BaseMutation):
             if payment.order
             else payment.checkout.channel.slug
         )
+        manager = get_plugin_manager_promise(info.context).get()
         try:
-            gateway.void(payment, info.context.plugins, channel_slug=channel_slug)
+            gateway.void(payment, manager, channel_slug=channel_slug)
             payment.refresh_from_db()
         except PaymentError as e:
-            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR)
+            raise ValidationError(str(e), code=PaymentErrorCode.PAYMENT_ERROR.value)
         return PaymentVoid(payment=payment)
 
 
@@ -380,7 +469,7 @@ class PaymentInitialize(BaseMutation):
         channel = graphene.String(
             description="Slug of a channel for which the data should be returned.",
         )
-        payment_data = graphene.JSONString(
+        payment_data = JSONString(
             required=False,
             description=(
                 "Client-side generated data required to initialize the payment."
@@ -417,11 +506,13 @@ class PaymentInitialize(BaseMutation):
         return channel
 
     @classmethod
-    def perform_mutation(cls, _root, info, gateway, channel, payment_data):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, channel, gateway, payment_data
+    ):
         cls.validate_channel(channel_slug=channel)
-
+        manager = get_plugin_manager_promise(info.context).get()
         try:
-            response = info.context.plugins.initialize_payment(
+            response = manager.initialize_payment(
                 gateway, payment_data, channel_slug=channel
             )
         except PaymentError as e:
@@ -467,7 +558,7 @@ class PaymentCheckBalanceInput(graphene.InputObjectType):
 
 
 class PaymentCheckBalance(BaseMutation):
-    data = graphene.types.JSONString(description="Response from the gateway.")
+    data = JSONString(description="Response from the gateway.")
 
     class Arguments:
         input = PaymentCheckBalanceInput(
@@ -480,8 +571,8 @@ class PaymentCheckBalance(BaseMutation):
         error_type_field = "payment_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        manager = info.context.plugins
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
+        manager = get_plugin_manager_promise(info.context).get()
         gateway_id = data["input"]["gateway_id"]
         money = data["input"]["card"].get("money", {})
 
@@ -525,3 +616,460 @@ class PaymentCheckBalance(BaseMutation):
                     )
                 }
             )
+
+
+class TransactionUpdateInput(graphene.InputObjectType):
+    status = graphene.String(
+        description="Status of the transaction.",
+    )
+    type = graphene.String(
+        description="Payment type used for this transaction.",
+    )
+    reference = graphene.String(description="Reference of the transaction.")
+    available_actions = graphene.List(
+        graphene.NonNull(TransactionActionEnum),
+        description="List of all possible actions for the transaction",
+    )
+    amount_authorized = MoneyInput(description="Amount authorized by this transaction.")
+    amount_charged = MoneyInput(description="Amount charged by this transaction.")
+    amount_refunded = MoneyInput(description="Amount refunded by this transaction.")
+    amount_voided = MoneyInput(description="Amount voided by this transaction.")
+
+    metadata = graphene.List(
+        graphene.NonNull(MetadataInput),
+        description="Payment public metadata.",
+        required=False,
+    )
+    private_metadata = graphene.List(
+        graphene.NonNull(MetadataInput),
+        description="Payment private metadata.",
+        required=False,
+    )
+
+
+class TransactionCreateInput(TransactionUpdateInput):
+    status = graphene.String(description="Status of the transaction.", required=True)
+    type = graphene.String(
+        description="Payment type used for this transaction.", required=True
+    )
+
+
+class TransactionEventInput(graphene.InputObjectType):
+    status = graphene.Field(
+        TransactionStatusEnum,
+        required=True,
+        description="Current status of the payment transaction.",
+    )
+    reference = graphene.String(description="Reference of the transaction.")
+    name = graphene.String(description="Name of the transaction.")
+
+
+class TransactionCreate(BaseMutation):
+    transaction = graphene.Field(TransactionItem)
+
+    class Arguments:
+        id = graphene.ID(
+            description="The ID of the checkout or order.",
+            required=True,
+        )
+        transaction = TransactionCreateInput(
+            required=True,
+            description="Input data required to create a new transaction object.",
+        )
+        transaction_event = TransactionEventInput(
+            description="Data that defines a transaction event."
+        )
+
+    class Meta:
+        auto_permission_message = False
+        description = (
+            "Create transaction for checkout or order. Requires the "
+            "following permissions: AUTHENTICATED_APP and HANDLE_PAYMENTS."
+            + ADDED_IN_34
+            + PREVIEW_FEATURE
+        )
+        error_type_class = common_types.TransactionCreateError
+        permissions = (PaymentPermissions.HANDLE_PAYMENTS,)
+
+    @classmethod
+    def check_permissions(cls, context, permissions=None):
+        """Determine whether app has rights to perform this mutation."""
+        permissions = permissions or cls._meta.permissions
+        if app := getattr(context, "app", None):
+            return app.has_perms(permissions)
+        return False
+
+    @classmethod
+    def validate_metadata_keys(  # type: ignore[override]
+        cls, metadata_list: List[dict], field_name, error_code
+    ):
+        if metadata_contains_empty_key(metadata_list):
+            raise ValidationError(
+                {
+                    "transaction": ValidationError(
+                        {
+                            field_name: ValidationError(
+                                "Metadata key cannot be empty.",
+                                code=error_code,
+                            )
+                        }
+                    )
+                }
+            )
+
+    @classmethod
+    def cleanup_money_data(cls, cleaned_data: dict):
+        if amount_authorized := cleaned_data.pop("amount_authorized", None):
+            cleaned_data["authorized_value"] = amount_authorized["amount"]
+        if amount_charged := cleaned_data.pop("amount_charged", None):
+            cleaned_data["charged_value"] = amount_charged["amount"]
+        if amount_refunded := cleaned_data.pop("amount_refunded", None):
+            cleaned_data["refunded_value"] = amount_refunded["amount"]
+        if amount_voided := cleaned_data.pop("amount_voided", None):
+            cleaned_data["voided_value"] = amount_voided["amount"]
+
+    @classmethod
+    def cleanup_metadata_data(cls, cleaned_data: dict):
+        if metadata := cleaned_data.pop("metadata", None):
+            cleaned_data["metadata"] = {data.key: data.value for data in metadata}
+        if private_metadata := cleaned_data.pop("private_metadata", None):
+            cleaned_data["private_metadata"] = {
+                data.key: data.value for data in private_metadata
+            }
+
+    @classmethod
+    def validate_instance(
+        cls, instance: Model, instance_id
+    ) -> Union[checkout_models.Checkout, order_models.Order]:
+        """Validate if provided instance is an order or checkout type."""
+        if not isinstance(instance, (checkout_models.Checkout, order_models.Order)):
+            raise ValidationError(
+                {
+                    "id": ValidationError(
+                        f"Couldn't resolve to Checkout or Order: {instance_id}",
+                        code=TransactionCreateErrorCode.NOT_FOUND.value,
+                    )
+                }
+            )
+        return instance
+
+    @classmethod
+    def validate_money_input(
+        cls, transaction_data: dict, currency: str, error_code: str
+    ):
+        if not transaction_data:
+            return
+        money_input_fields = [
+            "amount_authorized",
+            "amount_charged",
+            "amount_refunded",
+            "amount_voided",
+        ]
+        errors = {}
+        for money_field_name in money_input_fields:
+            field = transaction_data.get(money_field_name)
+            if not field:
+                continue
+            if field["currency"] != currency:
+                errors[money_field_name] = ValidationError(
+                    f"Currency needs to be the same as for order: {currency}",
+                    code=error_code,
+                )
+        if errors:
+            raise ValidationError(errors)
+
+    @classmethod
+    def validate_input(
+        cls, instance: Model, *, id, transaction
+    ) -> Union[checkout_models.Checkout, order_models.Order]:
+        instance = cls.validate_instance(instance, id)
+        currency = instance.currency
+
+        cls.validate_money_input(
+            transaction,
+            currency,
+            TransactionCreateErrorCode.INCORRECT_CURRENCY.value,
+        )
+        cls.validate_metadata_keys(
+            transaction.get("metadata", []),
+            field_name="metadata",
+            error_code=TransactionCreateErrorCode.METADATA_KEY_REQUIRED.value,
+        )
+        cls.validate_metadata_keys(
+            transaction.get("private_metadata", []),
+            field_name="privateMetadata",
+            error_code=TransactionCreateErrorCode.METADATA_KEY_REQUIRED.value,
+        )
+        return instance
+
+    @classmethod
+    def create_transaction(
+        cls, transaction_input: dict
+    ) -> payment_models.TransactionItem:
+        cls.cleanup_money_data(transaction_input)
+        cls.cleanup_metadata_data(transaction_input)
+        return payment_models.TransactionItem.objects.create(
+            **transaction_input,
+        )
+
+    @classmethod
+    def create_transaction_event(
+        cls, transaction_event_input: dict, transaction: payment_models.TransactionItem
+    ) -> payment_models.TransactionEvent:
+        return transaction.events.create(
+            status=transaction_event_input["status"],
+            reference=transaction_event_input.get("reference", ""),
+            name=transaction_event_input.get("name", ""),
+            transaction=transaction,
+        )
+
+    @classmethod
+    def add_amounts_to_order(cls, order_id: uuid.UUID, transaction_data: dict):
+        authorized_amount = transaction_data.get("authorized_value", 0)
+        charged_amount = transaction_data.get("charged_value", 0)
+        if not authorized_amount and not charged_amount:
+            return
+        add_to_order_total_authorized_and_total_charged(
+            order_id=order_id,
+            authorized_amount_to_add=authorized_amount,
+            charged_amount_to_add=charged_amount,
+        )
+
+    @classmethod
+    def perform_mutation(  # type: ignore[override]
+        cls,
+        _root,
+        info: ResolveInfo,
+        /,
+        *,
+        id: str,
+        transaction: Dict,
+        transaction_event=None
+    ):
+        order_or_checkout_instance = cls.get_node_or_error(info, id)
+
+        order_or_checkout_instance = cls.validate_input(
+            order_or_checkout_instance, id=id, transaction=transaction
+        )
+        transaction_data = {**transaction}
+        transaction_data["currency"] = order_or_checkout_instance.currency
+        if isinstance(order_or_checkout_instance, checkout_models.Checkout):
+            transaction_data["checkout_id"] = order_or_checkout_instance.pk
+        else:
+            transaction_data["order_id"] = order_or_checkout_instance.pk
+            if transaction_event:
+                app = get_app_promise(info.context).get()
+                order_transaction_event(
+                    order=order_or_checkout_instance,
+                    user=info.context.user,
+                    app=app,
+                    reference=transaction_event.get("reference", ""),
+                    status=transaction_event["status"],
+                    name=transaction_event.get("name", ""),
+                )
+        new_transaction = cls.create_transaction(transaction_data)
+        if order_id := transaction_data.get("order_id"):
+            cls.add_amounts_to_order(order_id, transaction_data)
+
+        if transaction_event:
+            cls.create_transaction_event(transaction_event, new_transaction)
+        return TransactionCreate(transaction=new_transaction)
+
+
+class TransactionUpdate(TransactionCreate):
+    transaction = graphene.Field(TransactionItem)
+
+    class Arguments:
+        id = graphene.ID(
+            description="The ID of the transaction.",
+            required=True,
+        )
+        transaction = TransactionUpdateInput(
+            description="Input data required to create a new transaction object.",
+        )
+        transaction_event = TransactionEventInput(
+            description="Data that defines a transaction transaction."
+        )
+
+    class Meta:
+        auto_permission_message = False
+        description = (
+            "Create transaction for checkout or order. Requires the "
+            "following permissions: AUTHENTICATED_APP and HANDLE_PAYMENTS."
+            + ADDED_IN_34
+            + PREVIEW_FEATURE
+        )
+        error_type_class = common_types.TransactionUpdateError
+        permissions = (PaymentPermissions.HANDLE_PAYMENTS,)
+        object_type = TransactionItem
+
+    @classmethod
+    def validate_transaction_input(
+        cls, instance: payment_models.TransactionItem, transaction_data
+    ):
+        currency = instance.currency
+        cls.validate_money_input(
+            transaction_data,
+            currency,
+            TransactionUpdateErrorCode.INCORRECT_CURRENCY.value,
+        )
+        cls.validate_metadata_keys(
+            transaction_data.get("metadata", []),
+            field_name="metadata",
+            error_code=TransactionUpdateErrorCode.METADATA_KEY_REQUIRED.value,
+        )
+        cls.validate_metadata_keys(
+            transaction_data.get("private_metadata", []),
+            field_name="privateMetadata",
+            error_code=TransactionUpdateErrorCode.METADATA_KEY_REQUIRED.value,
+        )
+
+    @classmethod
+    def update_amounts_for_order(
+        cls,
+        transaction: payment_models.TransactionItem,
+        order_id: uuid.UUID,
+        transaction_data: dict,
+    ):
+        current_authorized_amount = transaction.authorized_value
+        updated_authorized_amount = transaction_data.get(
+            "authorized_value", current_authorized_amount
+        )
+        authorized_amount_to_add = updated_authorized_amount - current_authorized_amount
+
+        current_charged_amount = transaction.charged_value
+        updated_charged_amount = transaction_data.get(
+            "charged_value", current_charged_amount
+        )
+        charged_amount_to_add = updated_charged_amount - current_charged_amount
+
+        if not authorized_amount_to_add and not charged_amount_to_add:
+            return
+        add_to_order_total_authorized_and_total_charged(
+            order_id=order_id,
+            authorized_amount_to_add=authorized_amount_to_add,
+            charged_amount_to_add=charged_amount_to_add,
+        )
+
+    @classmethod
+    def perform_mutation(  # type: ignore[override]
+        cls,
+        _root,
+        info: ResolveInfo,
+        /,
+        *,
+        id: str,
+        transaction=None,
+        transaction_event=None
+    ):
+        instance = cls.get_node_or_error(info, id, only_type=TransactionItem)
+        if transaction:
+            cls.validate_transaction_input(instance, transaction)
+            cls.cleanup_money_data(transaction)
+            cls.cleanup_metadata_data(transaction)
+            if instance.order_id:
+                cls.update_amounts_for_order(instance, instance.order_id, transaction)
+            instance = cls.construct_instance(instance, transaction)
+            instance.save()
+
+        if transaction_event:
+            cls.create_transaction_event(transaction_event, instance)
+            if instance.order:
+                app = get_app_promise(info.context).get()
+                order_transaction_event(
+                    order=instance.order,
+                    user=info.context.user,
+                    app=app,
+                    reference=transaction_event.get("reference", ""),
+                    status=transaction_event["status"],
+                    name=transaction_event.get("name", ""),
+                )
+        return TransactionUpdate(transaction=instance)
+
+
+class TransactionRequestAction(BaseMutation):
+    transaction = graphene.Field(TransactionItem)
+
+    class Arguments:
+        id = graphene.ID(
+            description="The ID of the transaction.",
+            required=True,
+        )
+        action_type = graphene.Argument(
+            TransactionActionEnum,
+            required=True,
+            description="Determines the action type.",
+        )
+        amount = PositiveDecimal(
+            description=(
+                "Transaction request amount. If empty for refund or capture, maximal "
+                "possible amount will be used."
+            )
+        )
+
+    class Meta:
+        description = (
+            "Request an action for payment transaction." + ADDED_IN_34 + PREVIEW_FEATURE
+        )
+        error_type_class = common_types.TransactionRequestActionError
+        permissions = (
+            PaymentPermissions.HANDLE_PAYMENTS,
+            OrderPermissions.MANAGE_ORDERS,
+        )
+
+    @classmethod
+    def check_permissions(cls, context, permissions=None):
+        required_permissions = permissions or cls._meta.permissions
+        requestor = get_user_or_app_from_context(context)
+        for required_permission in required_permissions:
+            # We want to allow to call this mutation for requestor with one of following
+            # permission: manage_orders, handle_payments
+            if requestor and requestor.has_perm(required_permission):
+                return True
+        return False
+
+    @classmethod
+    def handle_transaction_action(
+        cls, action, action_kwargs, action_value: Optional[Decimal]
+    ):
+        if action == TransactionAction.VOID:
+            request_void_action(**action_kwargs)
+        elif action == TransactionAction.CHARGE:
+            transaction = action_kwargs["transaction"]
+            action_value = action_value or transaction.authorized_value
+            action_value = min(action_value, transaction.authorized_value)
+            request_charge_action(**action_kwargs, charge_value=action_value)
+        elif action == TransactionAction.REFUND:
+            transaction = action_kwargs["transaction"]
+            action_value = action_value or transaction.charged_value
+            action_value = min(action_value, transaction.charged_value)
+            request_refund_action(**action_kwargs, refund_value=action_value)
+
+    @classmethod
+    def perform_mutation(cls, root, info: ResolveInfo, /, **data):
+        id = data["id"]
+        action_type = data["action_type"]
+        action_value = data.get("amount")
+        transaction = cls.get_node_or_error(info, id, only_type=TransactionItem)
+        channel_slug = (
+            transaction.order.channel.slug
+            if transaction.order_id
+            else transaction.checkout.channel.slug
+        )
+        app = get_app_promise(info.context).get()
+        manager = get_plugin_manager_promise(info.context).get()
+        action_kwargs = {
+            "channel_slug": channel_slug,
+            "user": info.context.user,
+            "app": app,
+            "transaction": transaction,
+            "manager": manager,
+        }
+
+        try:
+            cls.handle_transaction_action(action_type, action_kwargs, action_value)
+        except PaymentError as e:
+            error_enum = TransactionRequestActionErrorCode
+            code = error_enum.MISSING_TRANSACTION_ACTION_REQUEST_WEBHOOK.value
+            raise ValidationError(str(e), code=code)
+        return TransactionRequestAction(transaction=transaction)

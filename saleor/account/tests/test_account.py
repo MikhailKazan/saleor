@@ -1,17 +1,14 @@
-import uuid
 from urllib.parse import urlencode
 
 import i18naddress
 import pytest
 from django.core.exceptions import ValidationError
 from django.http import QueryDict
-from django.template import Context, Template
 from django_countries.fields import Country
 
 from ...order.models import Order
 from .. import forms, i18n
 from ..models import User
-from ..templatetags.i18n_address_tags import format_address
 from ..validators import validate_possible_number
 
 
@@ -24,7 +21,7 @@ def test_address_form_for_country(country):
         "phone": "123456789",
     }
 
-    form = forms.get_address_form(data, country_code=country)[0]
+    form = forms.get_address_form(data, country_code=country)
     errors = form.errors
     rules = i18naddress.get_validation_rules({"country_code": country})
     required = rules.required_fields
@@ -57,7 +54,7 @@ def test_address_form_postal_code_validation():
         "country": "PL",
         "postal_code": "XXX",
     }
-    form = forms.get_address_form(data, country_code="PL")[0]
+    form = forms.get_address_form(data, country_code="PL")
     errors = form.errors
     assert "postal_code" in errors
 
@@ -72,7 +69,7 @@ def test_address_form_postal_code_validation():
 )
 def test_address_form_phone_number_validation(country, phone, is_valid):
     data = {"country": country, "phone": phone}
-    form = forms.get_address_form(data, country_code="PL")[0]
+    form = forms.get_address_form(data, country_code="PL")
     errors = form.errors
     if not is_valid:
         assert "phone" in errors
@@ -81,48 +78,43 @@ def test_address_form_phone_number_validation(country, phone, is_valid):
 
 
 @pytest.mark.parametrize(
-    "form_data, form_valid, expected_preview, expected_country",
+    "form_data, form_valid, expected_country",
     [
-        ({"preview": True}, False, True, "PL"),
+        ({}, False, "PL"),
         (
             {
-                "preview": False,
                 "street_address_1": "Foo bar",
                 "postal_code": "00-123",
                 "city": "Warsaw",
             },
             True,
-            False,
             "PL",
         ),
-        ({"preview": True, "country": "US"}, False, True, "US"),
+        ({"country": "US"}, False, "US"),
         (
             {
-                "preview": False,
                 "street_address_1": "Foo bar",
                 "postal_code": "0213",
                 "city": "Warsaw",
             },
             False,
-            False,
             "PL",
         ),
     ],
 )
-def test_get_address_form(form_data, form_valid, expected_preview, expected_country):
+def test_get_address_form(form_data, form_valid, expected_country):
     data = {"first_name": "John", "last_name": "Doe", "country": "PL"}
     data.update(form_data)
     query_dict = urlencode(data)
-    form, preview = forms.get_address_form(
+    form = forms.get_address_form(
         data=QueryDict(query_dict), country_code=data["country"]
     )
-    assert preview is expected_preview
     assert form.is_valid() is form_valid
     assert form.i18n_country_code == expected_country
 
 
 def test_get_address_form_no_country_code():
-    form, _ = forms.get_address_form(data={}, country_code=None)
+    form = forms.get_address_form(data={}, country_code=None)
     assert isinstance(form, i18n.AddressForm)
 
 
@@ -166,34 +158,6 @@ def test_validate_possible_number(input_data, is_valid):
         validate_possible_number(**input_data)
 
 
-def test_format_address(address):
-    formatted_address = format_address(address)
-    address_html = "<br>".join(map(str, formatted_address["address_lines"]))
-    context = Context({"address": address})
-    tpl = Template("{% load i18n_address_tags %}" "{% format_address address %}")
-    rendered_html = tpl.render(context)
-    assert address_html in rendered_html
-    assert "inline-address" not in rendered_html
-    assert str(address.phone) in rendered_html
-
-
-def test_format_address_all_options(address):
-    formatted_address = format_address(
-        address, include_phone=False, inline=True, latin=True
-    )
-    address_html = ", ".join(map(str, formatted_address["address_lines"]))
-    context = Context({"address": address})
-    tpl = Template(
-        r"{% load i18n_address_tags %}"
-        r"{% format_address address include_phone=False inline=True"
-        r" latin=True %}"
-    )
-    rendered_html = tpl.render(context)
-    assert address_html in rendered_html
-    assert "inline-address" in rendered_html
-    assert str(address.phone) not in rendered_html
-
-
 def test_address_as_data(address):
     data = address.as_data()
     assert data == {
@@ -208,6 +172,8 @@ def test_address_as_data(address):
         "country": "PL",
         "country_area": "",
         "phone": "+48713988102",
+        "metadata": {},
+        "private_metadata": {},
     }
 
 
@@ -297,12 +263,10 @@ def test_customers_doesnt_return_duplicates(customer_user, channel_USD):
             Order(
                 user=customer_user,
                 channel=channel_USD,
-                token=str(uuid.uuid4()),
             ),
             Order(
                 user=customer_user,
                 channel=channel_USD,
-                token=str(uuid.uuid4()),
             ),
         ]
     )
@@ -314,6 +278,5 @@ def test_customers_show_staff_with_order(admin_user, channel_USD):
     Order.objects.create(
         user=admin_user,
         channel=channel_USD,
-        token=str(uuid.uuid4()),
     )
     assert User.objects.customers().count() == 1

@@ -1,11 +1,14 @@
 from collections import defaultdict
+from typing import Dict, List, cast
 
 import graphene
 from django.core.exceptions import ValidationError
+from django.db.models import Exists, OuterRef
 from django.db.utils import IntegrityError
 
-from ....core.permissions import ShippingPermissions
+from ....channel import models as channel_models
 from ....core.tracing import traced_atomic_transaction
+from ....permission.enums import ShippingPermissions
 from ....product import models as product_models
 from ....shipping import models
 from ....shipping.error_codes import ShippingErrorCode
@@ -17,9 +20,12 @@ from ....shipping.utils import (
     get_countries_without_shipping_zone,
 )
 from ...channel.types import ChannelContext
+from ...core import ResolveInfo
+from ...core.fields import JSONString
 from ...core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
 from ...core.scalars import WeightScalar
-from ...core.types.common import ShippingError
+from ...core.types import NonNullList, ShippingError
+from ...plugins.dataloaders import get_plugin_manager_promise
 from ...product import types as product_types
 from ...shipping import types as shipping_types
 from ...utils import resolve_global_ids_to_primary_keys
@@ -37,7 +43,7 @@ class ShippingPostalCodeRulesCreateInputRange(graphene.InputObjectType):
 
 class ShippingPriceInput(graphene.InputObjectType):
     name = graphene.String(description="Name of the shipping method.")
-    description = graphene.JSONString(description="Shipping method description.")
+    description = JSONString(description="Shipping method description.")
     minimum_order_weight = WeightScalar(
         description="Minimum order weight to use this shipping method."
     )
@@ -54,16 +60,23 @@ class ShippingPriceInput(graphene.InputObjectType):
     shipping_zone = graphene.ID(
         description="Shipping zone this method belongs to.", name="shippingZone"
     )
-    add_postal_code_rules = graphene.List(
-        graphene.NonNull(ShippingPostalCodeRulesCreateInputRange),
+    add_postal_code_rules = NonNullList(
+        ShippingPostalCodeRulesCreateInputRange,
         description="Postal code rules to add.",
     )
-    delete_postal_code_rules = graphene.List(
-        graphene.NonNull(graphene.ID),
+    delete_postal_code_rules = NonNullList(
+        graphene.ID,
         description="Postal code rules to delete.",
     )
     inclusion_type = PostalCodeRuleInclusionTypeEnum(
         description="Inclusion type for currently assigned postal code rules.",
+    )
+    tax_class = graphene.ID(
+        description=(
+            "ID of a tax class to assign to this shipping method. If not provided, "
+            "the default tax class will be used."
+        ),
+        required=False,
     )
 
 
@@ -72,7 +85,7 @@ class ShippingZoneCreateInput(graphene.InputObjectType):
         description="Shipping zone's name. Visible only to the staff."
     )
     description = graphene.String(description="Description of the shipping zone.")
-    countries = graphene.List(
+    countries = NonNullList(
         graphene.String, description="List of countries in this shipping zone."
     )
     default = graphene.Boolean(
@@ -81,31 +94,31 @@ class ShippingZoneCreateInput(graphene.InputObjectType):
             "zones."
         )
     )
-    add_warehouses = graphene.List(
+    add_warehouses = NonNullList(
         graphene.ID,
         description="List of warehouses to assign to a shipping zone",
     )
-    add_channels = graphene.List(
-        graphene.NonNull(graphene.ID),
+    add_channels = NonNullList(
+        graphene.ID,
         description="List of channels to assign to the shipping zone.",
     )
 
 
 class ShippingZoneUpdateInput(ShippingZoneCreateInput):
-    remove_warehouses = graphene.List(
+    remove_warehouses = NonNullList(
         graphene.ID,
         description="List of warehouses to unassign from a shipping zone",
     )
-    remove_channels = graphene.List(
-        graphene.NonNull(graphene.ID),
+    remove_channels = NonNullList(
+        graphene.ID,
         description="List of channels to unassign from the shipping zone.",
     )
 
 
 class ShippingZoneMixin:
     @classmethod
-    def clean_input(cls, info, instance, data, input_cls=None):
-        errors = defaultdict(list)
+    def clean_input(cls, info: ResolveInfo, instance, data, **kwargs):
+        errors: defaultdict[str, List[ValidationError]] = defaultdict(list)
         cls.check_duplicates(
             errors, data, "add_warehouses", "remove_warehouses", "warehouses"
         )
@@ -116,7 +129,11 @@ class ShippingZoneMixin:
         if errors:
             raise ValidationError(errors)
 
-        cleaned_input = super().clean_input(info, instance, data)
+        cleaned_input = super().clean_input(  # type: ignore[misc] # mixin
+            info, instance, data, **kwargs
+        )
+        if add_warehouses := cleaned_input.get("add_warehouses"):
+            cls.clean_add_warehouses(instance, add_warehouses, cleaned_input)
         cleaned_input = cls.clean_default(instance, cleaned_input)
         return cleaned_input
 
@@ -141,6 +158,101 @@ class ShippingZoneMixin:
             errors[error_class_field].append(error)
 
     @classmethod
+    def clean_add_warehouses(cls, shipping_zone, warehouses, cleaned_input):
+        """Check if all warehouses to add has common channel with shipping zone.
+
+        Raise and error when the condition is not fulfilled.
+        """
+        warehouse_ids = [warehouse.id for warehouse in warehouses]
+
+        remove_channel_ids = set()
+        if remove_channels := cleaned_input.get("remove_channels"):
+            remove_channel_ids = {channel.id for channel in remove_channels}
+
+        add_channel_ids = set()
+        if add_channels := cleaned_input.get("add_channels"):
+            add_channel_ids = {channel.id for channel in add_channels}
+
+        ChannelWarehouse = channel_models.Channel.warehouses.through  # type: ignore[attr-defined] # raw access to the through model # noqa: E501
+        channel_warehouses = ChannelWarehouse.objects.filter(
+            warehouse_id__in=warehouse_ids
+        )
+
+        # any warehouse from the list cannot be assigned when:
+        # 1) where there are no channels assigned to any warehouse
+        # 2) any channel is will be not assigned to the shipping zone
+        if not channel_warehouses or (not shipping_zone.id and not add_channel_ids):
+            invalid_warehouse_ids = warehouse_ids
+
+        warehouse_to_channel_mapping = defaultdict(set)
+        for warehouse_id, channel_id in channel_warehouses.values_list(
+            "warehouse_id", "channel_id"
+        ):
+            warehouse_to_channel_mapping[warehouse_id].add(channel_id)
+
+        # if the shipping zone does not exist yet, all zone channels will be channels
+        # provided in `add_channels` field
+        shipping_zone_channel_ids = (
+            add_channel_ids
+            if not shipping_zone.id
+            else cls._get_shipping_zone_channel_ids(
+                shipping_zone, remove_channel_ids, add_channel_ids
+            )
+        )
+
+        invalid_warehouse_ids = cls._find_invalid_warehouses(
+            warehouse_to_channel_mapping, warehouse_ids, shipping_zone_channel_ids
+        )
+
+        if invalid_warehouse_ids:
+            invalid_warehouses = {
+                graphene.Node.to_global_id("Warehouse", pk)
+                for pk in invalid_warehouse_ids
+            }
+            raise ValidationError(
+                {
+                    "add_warehouses": ValidationError(
+                        "Only warehouses that have common channel with shipping zone "
+                        "can be assigned.",
+                        code=ShippingErrorCode.INVALID.value,
+                        params={
+                            "warehouses": invalid_warehouses,
+                        },
+                    )
+                }
+            )
+
+    @staticmethod
+    def _get_shipping_zone_channel_ids(
+        shipping_zone, remove_channel_ids, add_channel_ids
+    ):
+        # get shipping zone channels
+        ShippingZoneChannel = models.ShippingZone.channels.through
+        shipping_zone_channel_ids = set(
+            ShippingZoneChannel.objects.filter(shippingzone_id=shipping_zone.id)
+            .exclude(channel_id__in=remove_channel_ids)
+            .values_list("channel_id", flat=True)
+        )
+        # shipping zone channels set need to be updated with channels
+        # that will be removed and added to shipping zone
+        return shipping_zone_channel_ids | add_channel_ids
+
+    @staticmethod
+    def _find_invalid_warehouses(
+        warehouse_to_channel_mapping, warehouse_ids, zone_channel_ids
+    ):
+        invalid_warehouse_ids = []
+        for warehouse_id in warehouse_ids:
+            warehouse_channels = warehouse_to_channel_mapping.get(warehouse_id)
+            # warehouse cannot be added if it hasn't got any channel assigned
+            # or if it does not have common channel with shipping zone
+            if not warehouse_channels or not warehouse_channels.intersection(
+                zone_channel_ids
+            ):
+                invalid_warehouse_ids.append(warehouse_id)
+        return invalid_warehouse_ids
+
+    @classmethod
     def clean_default(cls, instance, data):
         default = data.get("default")
         if default:
@@ -161,38 +273,91 @@ class ShippingZoneMixin:
         return data
 
     @classmethod
-    @traced_atomic_transaction()
-    def _save_m2m(cls, info, instance, cleaned_data):
-        super()._save_m2m(info, instance, cleaned_data)
+    def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
+        with traced_atomic_transaction():
+            super()._save_m2m(info, instance, cleaned_data)  # type: ignore[misc] # mixin # noqa: E501
 
-        add_warehouses = cleaned_data.get("add_warehouses")
-        if add_warehouses:
-            instance.warehouses.add(*add_warehouses)
+            add_warehouses = cleaned_data.get("add_warehouses")
+            if add_warehouses:
+                instance.warehouses.add(*add_warehouses)
 
-        remove_warehouses = cleaned_data.get("remove_warehouses")
-        if remove_warehouses:
-            instance.warehouses.remove(*remove_warehouses)
+            remove_warehouses = cleaned_data.get("remove_warehouses")
+            if remove_warehouses:
+                instance.warehouses.remove(*remove_warehouses)
 
-        add_channels = cleaned_data.get("add_channels")
-        if add_channels:
-            instance.channels.add(*add_channels)
+            add_channels = cleaned_data.get("add_channels")
+            if add_channels:
+                instance.channels.add(*add_channels)
 
-        remove_channels = cleaned_data.get("remove_channels")
-        if remove_channels:
-            instance.channels.remove(*remove_channels)
-            shipping_channel_listings = (
-                models.ShippingMethodChannelListing.objects.filter(
-                    shipping_method__shipping_zone=instance, channel__in=remove_channels
+            remove_channels = cleaned_data.get("remove_channels")
+            if remove_channels:
+                instance.channels.remove(*remove_channels)
+                shipping_channel_listings = (
+                    models.ShippingMethodChannelListing.objects.filter(
+                        shipping_method__shipping_zone=instance,
+                        channel__in=remove_channels,
+                    )
                 )
+                shipping_method_ids = list(
+                    shipping_channel_listings.values_list(
+                        "shipping_method_id", flat=True
+                    )
+                )
+                shipping_channel_listings.delete()
+                channel_ids = [channel.id for channel in remove_channels]
+                cls.delete_invalid_shipping_zone_to_warehouse_relation(instance)
+                drop_invalid_shipping_methods_relations_for_given_channels.delay(
+                    shipping_method_ids, channel_ids
+                )
+
+    @classmethod
+    def delete_invalid_shipping_zone_to_warehouse_relation(cls, shipping_zone):
+        """Drop zone-warehouse relations that becomes invalid after channels deletion.
+
+        Remove all shipping zone to warehouse relations that will not have common
+        channel after removing given channels from the shipping zone.
+        """
+        WarehouseShippingZone = models.ShippingZone.warehouses.through  # type: ignore[attr-defined] # raw access to the through model # noqa: E501
+        ChannelWarehouse = channel_models.Channel.warehouses.through  # type: ignore[attr-defined] # raw access to the through model # noqa: E501
+        ShippingZoneChannel = models.ShippingZone.channels.through
+
+        warehouse_shipping_zones = WarehouseShippingZone.objects.filter(
+            shippingzone_id=shipping_zone.id
+        )
+
+        channel_warehouses = ChannelWarehouse.objects.filter(
+            Exists(
+                warehouse_shipping_zones.filter(warehouse_id=OuterRef("warehouse_id"))
             )
-            shipping_method_ids = list(
-                shipping_channel_listings.values_list("shipping_method_id", flat=True)
-            )
-            shipping_channel_listings.delete()
-            channel_ids = [channel.id for channel in remove_channels]
-            drop_invalid_shipping_methods_relations_for_given_channels.delay(
-                shipping_method_ids, channel_ids
-            )
+        )
+
+        warehouse_to_channel_mapping = defaultdict(set)
+        for warehouse_id, channel_id in channel_warehouses.values_list(
+            "warehouse_id", "channel_id"
+        ):
+            warehouse_to_channel_mapping[warehouse_id].add(channel_id)
+
+        shipping_zone_channel_ids = set(
+            ShippingZoneChannel.objects.filter(
+                shippingzone_id=shipping_zone.id
+            ).values_list("channel_id", flat=True)
+        )
+
+        shipping_zone_warehouses_to_delete = []
+        for id, warehouse_id in warehouse_shipping_zones.values_list(
+            "id", "warehouse_id"
+        ):
+            warehouse_channels = warehouse_to_channel_mapping.get(warehouse_id, set())
+            # if there is no common channels between shipping zone and warehouse
+            # the relation should be deleted
+            if not warehouse_channels or not warehouse_channels.intersection(
+                shipping_zone_channel_ids
+            ):
+                shipping_zone_warehouses_to_delete.append(id)
+
+        WarehouseShippingZone.objects.filter(
+            id__in=shipping_zone_warehouses_to_delete
+        ).delete()
 
 
 class ShippingZoneCreate(ShippingZoneMixin, ModelMutation):
@@ -208,6 +373,11 @@ class ShippingZoneCreate(ShippingZoneMixin, ModelMutation):
         permissions = (ShippingPermissions.MANAGE_SHIPPING,)
         error_type_class = ShippingError
         error_type_field = "shipping_errors"
+
+    @classmethod
+    def post_save_action(cls, info: ResolveInfo, instance, _cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.shipping_zone_created, instance)
 
     @classmethod
     def success_response(cls, instance):
@@ -233,6 +403,11 @@ class ShippingZoneUpdate(ShippingZoneMixin, ModelMutation):
         error_type_field = "shipping_errors"
 
     @classmethod
+    def post_save_action(cls, info: ResolveInfo, instance, _cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.shipping_zone_updated, instance)
+
+    @classmethod
     def success_response(cls, instance):
         instance = ChannelContext(node=instance, channel_slug=None)
         response = super().success_response(instance)
@@ -253,6 +428,11 @@ class ShippingZoneDelete(ModelDeleteMutation):
         error_type_field = "shipping_errors"
 
     @classmethod
+    def post_save_action(cls, info: ResolveInfo, instance, _cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.shipping_zone_deleted, instance)
+
+    @classmethod
     def success_response(cls, instance):
         instance = ChannelContext(node=instance, channel_slug=None)
         response = super().success_response(instance)
@@ -266,14 +446,14 @@ class ShippingMethodTypeMixin:
         return shipping_types.ShippingMethodType
 
     @classmethod
-    def get_instance(cls, info, **data):
+    def get_instance(cls, info: ResolveInfo, **data):
         object_id = data.get("id")
         if object_id:
-            instance = cls.get_node_or_error(
+            instance = cls.get_node_or_error(  # type: ignore[attr-defined] # mixin
                 info, object_id, qs=models.ShippingMethod.objects
             )
         else:
-            instance = cls._meta.model()
+            instance = cls._meta.model()  # type: ignore[attr-defined] # mixin
         return instance
 
 
@@ -283,9 +463,11 @@ class ShippingPriceMixin:
         return ShippingMethodType
 
     @classmethod
-    def clean_input(cls, info, instance, data, input_cls=None):
-        cleaned_input = super().clean_input(info, instance, data)
-        errors = {}
+    def clean_input(cls, info: ResolveInfo, instance, data, **kwargs):
+        cleaned_input = super().clean_input(  # type: ignore[misc] # mixin
+            info, instance, data, **kwargs
+        )
+        errors: Dict[str, ValidationError] = {}
         cls.clean_weight(cleaned_input, errors)
         if (
             "minimum_delivery_days" in cleaned_input
@@ -307,11 +489,10 @@ class ShippingPriceMixin:
                 {
                     "inclusion_type": ValidationError(
                         "This field is required.",
-                        code=ShippingErrorCode.REQUIRED,
+                        code=ShippingErrorCode.REQUIRED.value,
                     )
                 }
             )
-
         return cleaned_input
 
     @classmethod
@@ -322,12 +503,12 @@ class ShippingPriceMixin:
         if min_weight and min_weight.value < 0:
             errors["minimum_order_weight"] = ValidationError(
                 "Shipping can't have negative weight.",
-                code=ShippingErrorCode.INVALID,
+                code=ShippingErrorCode.INVALID.value,
             )
         if max_weight and max_weight.value < 0:
             errors["maximum_order_weight"] = ValidationError(
                 "Shipping can't have negative weight.",
-                code=ShippingErrorCode.INVALID,
+                code=ShippingErrorCode.INVALID.value,
             )
 
         if errors:
@@ -345,7 +526,7 @@ class ShippingPriceMixin:
                             "Maximum order weight should be larger than the "
                             "minimum order weight."
                         ),
-                        code=ShippingErrorCode.MAX_LESS_THAN_MIN,
+                        code=ShippingErrorCode.MAX_LESS_THAN_MIN.value,
                     )
                 }
             )
@@ -406,32 +587,34 @@ class ShippingPriceMixin:
             )
 
     @classmethod
-    @traced_atomic_transaction()
-    def save(cls, info, instance, cleaned_input):
-        super().save(info, instance, cleaned_input)
+    def save(cls, info: ResolveInfo, instance, cleaned_input):
+        with traced_atomic_transaction():
+            super().save(info, instance, cleaned_input)  # type: ignore[misc] # mixin
 
-        delete_postal_code_rules = cleaned_input.get("delete_postal_code_rules")
-        if delete_postal_code_rules:
-            instance.postal_code_rules.filter(id__in=delete_postal_code_rules).delete()
+            delete_postal_code_rules = cleaned_input.get("delete_postal_code_rules")
+            if delete_postal_code_rules:
+                instance.postal_code_rules.filter(
+                    id__in=delete_postal_code_rules
+                ).delete()
 
-        if cleaned_input.get("add_postal_code_rules"):
-            inclusion_type = cleaned_input["inclusion_type"]
-            for postal_code_rule in cleaned_input["add_postal_code_rules"]:
-                start = postal_code_rule["start"]
-                end = postal_code_rule.get("end")
-                try:
-                    instance.postal_code_rules.create(
-                        start=start, end=end, inclusion_type=inclusion_type
-                    )
-                except IntegrityError:
-                    raise ValidationError(
-                        {
-                            "addPostalCodeRules": ValidationError(
-                                f"Entry start: {start}, end: {end} already exists.",
-                                code=ShippingErrorCode.ALREADY_EXISTS.value,
-                            )
-                        }
-                    )
+            if cleaned_input.get("add_postal_code_rules"):
+                inclusion_type = cleaned_input["inclusion_type"]
+                for postal_code_rule in cleaned_input["add_postal_code_rules"]:
+                    start = postal_code_rule["start"]
+                    end = postal_code_rule.get("end")
+                    try:
+                        instance.postal_code_rules.create(
+                            start=start, end=end, inclusion_type=inclusion_type
+                        )
+                    except IntegrityError:
+                        raise ValidationError(
+                            {
+                                "addPostalCodeRules": ValidationError(
+                                    f"Entry start: {start}, end: {end} already exists.",
+                                    code=ShippingErrorCode.ALREADY_EXISTS.value,
+                                )
+                            }
+                        )
 
 
 class ShippingPriceCreate(ShippingPriceMixin, ShippingMethodTypeMixin, ModelMutation):
@@ -456,6 +639,11 @@ class ShippingPriceCreate(ShippingPriceMixin, ShippingMethodTypeMixin, ModelMuta
         error_type_class = ShippingError
         error_type_field = "shipping_errors"
         errors_mapping = {"price_amount": "price"}
+
+    @classmethod
+    def post_save_action(cls, info: ResolveInfo, instance, _cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.shipping_price_created, instance)
 
     @classmethod
     def success_response(cls, instance):
@@ -492,6 +680,11 @@ class ShippingPriceUpdate(ShippingPriceMixin, ShippingMethodTypeMixin, ModelMuta
         errors_mapping = {"price_amount": "price"}
 
     @classmethod
+    def post_save_action(cls, info: ResolveInfo, instance, _cleaned_input):
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.shipping_price_updated, instance)
+
+    @classmethod
     def success_response(cls, instance):
         shipping_method = ChannelContext(node=instance, channel_slug=None)
         response = super().success_response(shipping_method)
@@ -521,14 +714,20 @@ class ShippingPriceDelete(BaseMutation):
         error_type_field = "shipping_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        shipping_method = cls.get_node_or_error(
-            info, data.get("id"), qs=models.ShippingMethod.objects
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, id: str
+    ):
+        shipping_method = cast(
+            models.ShippingMethod,
+            cls.get_node_or_error(info, id, qs=models.ShippingMethod.objects),
         )
         shipping_method_id = shipping_method.id
         shipping_zone = shipping_method.shipping_zone
         shipping_method.delete()
         shipping_method.id = shipping_method_id
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.shipping_price_deleted, shipping_method)
+
         return ShippingPriceDelete(
             shipping_method=ChannelContext(node=shipping_method, channel_slug=None),
             shipping_zone=ChannelContext(node=shipping_zone, channel_slug=None),
@@ -536,7 +735,7 @@ class ShippingPriceDelete(BaseMutation):
 
 
 class ShippingPriceExcludeProductsInput(graphene.InputObjectType):
-    products = graphene.List(
+    products = NonNullList(
         graphene.ID,
         description="List of products which will be excluded.",
         required=True,
@@ -563,11 +762,12 @@ class ShippingPriceExcludeProducts(BaseMutation):
         error_type_field = "shipping_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, id, input
+    ):
         shipping_method = cls.get_node_or_error(
-            info, data.get("id"), qs=models.ShippingMethod.objects
+            info, id, qs=models.ShippingMethod.objects
         )
-        input = data.get("input")
         product_ids = input.get("products", [])
 
         product_db_ids = cls.get_global_ids_or_error(
@@ -582,6 +782,9 @@ class ShippingPriceExcludeProducts(BaseMutation):
         shipping_method.excluded_products.set(
             (current_excluded_products | product_to_exclude).distinct()
         )
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.shipping_price_updated, shipping_method)
+
         return ShippingPriceExcludeProducts(
             shipping_method=ChannelContext(node=shipping_method, channel_slug=None)
         )
@@ -595,7 +798,7 @@ class ShippingPriceRemoveProductFromExclude(BaseMutation):
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of a shipping price.")
-        products = graphene.List(
+        products = NonNullList(
             graphene.ID,
             required=True,
             description="List of products which will be removed from excluded list.",
@@ -608,19 +811,24 @@ class ShippingPriceRemoveProductFromExclude(BaseMutation):
         error_type_field = "shipping_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        shipping_method = cls.get_node_or_error(
-            info, data.get("id"), qs=models.ShippingMethod.objects
+    def perform_mutation(  # type: ignore[override]
+        cls, _root, info: ResolveInfo, /, *, id: str, products: list
+    ):
+        shipping_method = cast(
+            models.ShippingMethod,
+            cls.get_node_or_error(info, id, qs=models.ShippingMethod.objects),
         )
 
-        product_ids = data.get("products")
-        if product_ids:
+        if products:
             product_db_ids = cls.get_global_ids_or_error(
-                product_ids, product_types.Product, field="products"
+                products, product_types.Product, field="products"
             )
             shipping_method.excluded_products.set(
                 shipping_method.excluded_products.exclude(id__in=product_db_ids)
             )
+        manager = get_plugin_manager_promise(info.context).get()
+        cls.call_event(manager.shipping_price_updated, shipping_method)
+
         return ShippingPriceExcludeProducts(
             shipping_method=ChannelContext(node=shipping_method, channel_slug=None)
         )

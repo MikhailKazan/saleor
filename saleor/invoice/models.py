@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.db import models
-from django.db.models import JSONField  # type: ignore
+from django.db.models import JSONField
 from django.utils.timezone import now
 
 from ..app.models import App
@@ -12,21 +12,27 @@ from ..order.models import Order
 from . import InvoiceEvents
 
 
-class InvoiceQueryset(models.QuerySet):
+class InvoiceQueryset(models.QuerySet["Invoice"]):
     def ready(self):
         return self.filter(job__status=JobStatus.SUCCESS)
 
 
+InvoiceManager = models.Manager.from_queryset(InvoiceQueryset)
+
+
 class Invoice(ModelWithMetadata, Job):
     order = models.ForeignKey(
-        Order, related_name="invoices", null=True, on_delete=models.SET_NULL
+        Order,
+        related_name="invoices",
+        null=True,
+        on_delete=models.SET_NULL,
     )
     number = models.CharField(max_length=255, null=True)
     created = models.DateTimeField(null=True)
     external_url = models.URLField(null=True, max_length=2048)
     invoice_file = models.FileField(upload_to="invoices")
 
-    objects = models.Manager.from_queryset(InvoiceQueryset)()
+    objects = InvoiceManager()
 
     @property
     def url(self):

@@ -7,15 +7,14 @@ import unicodedata
 import uuid
 from collections import defaultdict
 from decimal import Decimal
-from typing import Type, Union
+from functools import lru_cache
+from typing import Any, Dict, Type, Union, cast
 from unittest.mock import patch
 
 from django.conf import settings
-from django.contrib.auth.models import Group, Permission
-from django.contrib.sites.models import Site
 from django.core.files import File
-from django.db.models import F, Q
-from django.urls import reverse
+from django.db import connection
+from django.db.models import F
 from django.utils import timezone
 from django.utils.text import slugify
 from faker import Factory
@@ -23,7 +22,7 @@ from faker.providers import BaseProvider
 from measurement.measures import Weight
 from prices import Money, TaxedMoney
 
-from ...account.models import Address, User
+from ...account.models import Address, Group, User
 from ...account.search import (
     generate_address_search_document_value,
     generate_user_fields_search_document_value,
@@ -32,7 +31,9 @@ from ...account.utils import store_user_address
 from ...attribute.models import (
     AssignedPageAttribute,
     AssignedProductAttribute,
+    AssignedProductAttributeValue,
     AssignedVariantAttribute,
+    AssignedVariantAttributeValue,
     Attribute,
     AttributePage,
     AttributeProduct,
@@ -44,28 +45,28 @@ from ...checkout import AddressType
 from ...checkout.fetch import fetch_checkout_info
 from ...checkout.models import Checkout
 from ...checkout.utils import add_variant_to_checkout
-from ...core.permissions import (
-    AccountPermissions,
-    CheckoutPermissions,
-    GiftcardPermissions,
-    OrderPermissions,
-    get_permissions,
-)
-from ...core.utils import build_absolute_uri
 from ...core.weight import zero_weight
 from ...discount import DiscountValueType, VoucherType
 from ...discount.models import Sale, SaleChannelListing, Voucher, VoucherChannelListing
 from ...discount.utils import fetch_discounts
 from ...giftcard import events as gift_card_events
 from ...giftcard.models import GiftCard, GiftCardTag
-from ...menu.models import Menu
+from ...menu.models import Menu, MenuItem
 from ...order import OrderStatus
 from ...order.models import Fulfillment, Order, OrderLine
-from ...order.search import prepare_order_search_document_value
+from ...order.search import prepare_order_search_vector_value
 from ...order.utils import update_order_status
 from ...page.models import Page, PageType
 from ...payment import gateway
 from ...payment.utils import create_payment
+from ...permission.enums import (
+    AccountPermissions,
+    CheckoutPermissions,
+    GiftcardPermissions,
+    OrderPermissions,
+    get_permissions,
+)
+from ...permission.models import Permission
 from ...plugins.manager import get_plugins_manager
 from ...product.models import (
     Category,
@@ -80,24 +81,23 @@ from ...product.models import (
     ProductVariantChannelListing,
     VariantMedia,
 )
-from ...product.search import update_products_search_document
+from ...product.search import update_products_search_vector
 from ...product.tasks import update_products_discounted_prices_of_discount_task
-from ...product.thumbnails import (
-    create_category_background_image_thumbnails,
-    create_collection_background_image_thumbnails,
-    create_product_thumbnails,
-)
+from ...product.utils.variant_prices import update_products_discounted_prices
 from ...shipping.models import (
     ShippingMethod,
     ShippingMethodChannelListing,
     ShippingMethodType,
     ShippingZone,
 )
+from ...tax.models import TaxClass, TaxConfiguration
+from ...tax.utils import get_tax_class_kwargs_for_order_line
 from ...warehouse import WarehouseClickAndCollectOption
 from ...warehouse.management import increase_stock
 from ...warehouse.models import PreorderAllocation, Stock, Warehouse
+from ..postgres import FlatConcatSearchVector
 
-fake = Factory.create()
+fake = cast(Any, Factory.create())
 fake.seed(0)
 
 PRODUCTS_LIST_DIR = "products-list/"
@@ -107,67 +107,52 @@ DUMMY_STAFF_PASSWORD = "password"
 DEFAULT_CURRENCY = os.environ.get("DEFAULT_CURRENCY", "USD")
 
 IMAGES_MAPPING = {
-    61: ["saleordemoproduct_paints_01.png"],
-    62: ["saleordemoproduct_paints_02.png"],
-    63: ["saleordemoproduct_paints_03.png"],
-    64: ["saleordemoproduct_paints_04.png"],
-    65: ["saleordemoproduct_paints_05.png"],
-    71: ["saleordemoproduct_fd_juice_06.png"],
-    72: ["saleordemoproduct_fd_juice_06.png"],  # FIXME inproper image
-    73: ["saleordemoproduct_fd_juice_05.png"],
-    74: ["saleordemoproduct_fd_juice_01.png"],
-    75: ["saleordemoproduct_fd_juice_03.png"],  # FIXME inproper image
-    76: ["saleordemoproduct_fd_juice_02.png"],  # FIXME inproper image
-    77: ["saleordemoproduct_fd_juice_03.png"],
-    78: ["saleordemoproduct_fd_juice_04.png"],
-    79: ["saleordemoproduct_fd_juice_02.png"],
-    81: ["saleordemoproduct_wine-red.png"],
-    82: ["saleordemoproduct_wine-white.png"],
-    83: ["saleordemoproduct_beer-02_1.png", "saleordemoproduct_beer-02_2.png"],
-    84: ["saleordemoproduct_beer-01_1.png", "saleordemoproduct_beer-01_2.png"],
-    85: ["saleordemoproduct_cuschion01.png"],
-    86: ["saleordemoproduct_cuschion02.png"],
-    87: [
-        "saleordemoproduct_sneakers_01_1.png",
-        "saleordemoproduct_sneakers_01_2.png",
-        "saleordemoproduct_sneakers_01_3.png",
-        "saleordemoproduct_sneakers_01_4.png",
+    126: ["saleor-headless-omnichannel-book.png"],
+    127: [
+        "saleor-white-plimsolls-1.png",
+        "saleor-white-plimsolls-2.png",
+        "saleor-white-plimsolls-3.png",
+        "saleor-white-plimsolls-4.png",
     ],
-    88: [
-        "saleordemoproduct_sneakers_02_1.png",
-        "saleordemoproduct_sneakers_02_2.png",
-        "saleordemoproduct_sneakers_02_3.png",
-        "saleordemoproduct_sneakers_02_4.png",
+    128: [
+        "saleor-blue-plimsolls-1.png",
+        "saleor-blue-plimsolls-2.png",
+        "saleor-blue-plimsolls-3.png",
+        "saleor-blue-plimsolls-4.png",
     ],
-    89: ["saleordemoproduct_cl_boot07_1.png", "saleordemoproduct_cl_boot07_2.png"],
-    107: ["saleordemoproduct_cl_polo01.png"],
-    108: ["saleordemoproduct_cl_polo02.png"],
-    109: ["saleordemoproduct_cl_polo03-woman.png"],
-    110: ["saleordemoproduct_cl_polo04-woman.png"],
-    111: [
-        "saleordemoproduct_cl_boot01_1.png",
-        "saleordemoproduct_cl_boot01_2.png",
-        "saleordemoproduct_cl_boot01_3.png",
+    129: ["saleor-dash-force-1.png", "saleor-dash-force-2.png"],
+    130: ["saleor-pauls-blanace-420-1.png", "saleor-pauls-blanace-420-2.png"],
+    131: ["saleor-grey-hoodie.png"],
+    132: ["saleor-blue-hoodie.png"],
+    133: ["saleor-white-hoodie.png"],
+    134: ["saleor-ascii-shirt-front.png", "saleor-ascii-shirt-back.png"],
+    135: ["saleor-team-tee-front.png", "saleor-team-tee-front.png"],
+    136: ["saleor-polo-shirt-front.png", "saleor-polo-shirt-back.png"],
+    137: ["saleor-blue-polygon-tee-front.png", "saleor-blue-polygon-tee-back.png"],
+    138: ["saleor-dark-polygon-tee-front.png", "saleor-dark-polygon-tee-back.png"],
+    141: ["saleor-beanie-1.png", "saleor-beanie-2.png"],
+    143: ["saleor-neck-warmer.png"],
+    144: ["saleor-sunnies.png"],
+    145: ["saleor-battle-tested-book.png"],
+    146: ["saleor-enterprise-cloud-book.png"],
+    147: ["saleor-own-your-stack-and-data-book.png"],
+    150: ["saleor-mighty-mug.png"],
+    151: ["saleor-cushion-blue.png"],
+    152: ["saleor-apple-drink.png"],
+    153: ["saleor-bean-drink.png"],
+    154: ["saleor-banana-drink.png"],
+    155: ["saleor-carrot-drink.png"],
+    156: ["saleor-sunnies-dark.png"],
+    157: [
+        "saleor-monospace-white-tee-front.png",
+        "saleor-monospace-white-tee-back.png",
     ],
-    112: ["saleordemoproduct_cl_boot03_1.png", "saleordemoproduct_cl_boot03_2.png"],
-    113: ["saleordemoproduct_cl_boot06_1.png", "saleordemoproduct_cl_boot06_2.png"],
-    114: [
-        "saleordemoproduct_cl_boot06_1.png",
-        "saleordemoproduct_cl_boot06_2.png",
-    ],  # FIXME incorrect image
-    115: ["saleordemoproduct_cl_bogo01_1.png"],
-    116: ["saleordemoproduct_cl_bogo02_1.png"],
-    117: ["saleordemoproduct_cl_bogo03_1.png"],
-    118: ["saleordemoproduct_cl_bogo04_1.png", "saleordemoproduct_cl_bogo04_2.png"],
-    119: ["saleor-digital-03_1.png"],
-    120: ["saleor-digital-03_2.png"],
-    121: ["saleor-digital-03_3.png"],
-    122: ["saleor-digital-03_4.png"],
-    123: ["saleor-digital-03_5.png"],
-    124: ["saleor-digital-03_6.png"],
-    125: ["saleordemoproduct_giftcard_01.png", "saleordemoproduct_giftcard_02.png"],
+    160: ["saleor-gift-100.png"],
+    161: ["saleor-white-cubes-tee-front.png", "saleor-white-cubes-tee-back.png"],
+    162: ["saleor-white-parrot-cushion.png"],
+    163: ["saleor-gift-500.png"],
+    164: ["saleor-gift-50.png"],
 }
-
 
 CATEGORY_IMAGES = {
     7: "accessories.jpg",
@@ -176,6 +161,21 @@ CATEGORY_IMAGES = {
 }
 
 COLLECTION_IMAGES = {1: "summer.jpg", 2: "clothing.jpg", 3: "clothing.jpg"}
+
+
+@lru_cache()
+def get_sample_data():
+    path = os.path.join(
+        settings.PROJECT_ROOT, "saleor", "static", "populatedb_data.json"
+    )
+    with open(path, encoding="utf8") as f:
+        db_items = json.load(f)
+    types = defaultdict(list)
+    # Sort db objects by its model
+    for item in db_items:
+        model = item.pop("model")
+        types[model].append(item)
+    return types
 
 
 def get_weight(weight):
@@ -199,23 +199,21 @@ def create_categories(categories_data, placeholder_dir):
         pk = category["pk"]
         defaults = category["fields"]
         parent = defaults["parent"]
-        image_name = (
-            CATEGORY_IMAGES[pk] if pk in CATEGORY_IMAGES else CATEGORY_IMAGES[parent]
-        )
-        background_image = get_image(placeholder_dir, image_name)
-        defaults["background_image"] = background_image
+        image_name = CATEGORY_IMAGES.get(pk)
+        if image_name:
+            background_image = get_image(placeholder_dir, image_name)
+            defaults["background_image"] = background_image
         if parent:
             defaults["parent"] = Category.objects.get(pk=parent)
         Category.objects.update_or_create(pk=pk, defaults=defaults)
-        create_category_background_image_thumbnails.delay(pk)
 
 
 def create_collection_channel_listings(collection_channel_listings_data):
-    channel_USD = Channel.objects.get(currency_code="USD")
-    channel_PLN = Channel.objects.get(currency_code="PLN")
+    channel_USD = Channel.objects.get(slug=settings.DEFAULT_CHANNEL_SLUG)
+    channel_PLN = Channel.objects.get(slug="channel-pln")
     for collection_channel_listing in collection_channel_listings_data:
         pk = collection_channel_listing["pk"]
-        defaults = collection_channel_listing["fields"]
+        defaults = dict(collection_channel_listing["fields"])
         defaults["collection_id"] = defaults.pop("collection")
         channel = defaults.pop("channel")
         defaults["channel_id"] = channel_USD.pk if channel == 1 else channel_PLN.pk
@@ -227,17 +225,17 @@ def create_collections(data, placeholder_dir):
     for collection in data:
         pk = collection["pk"]
         defaults = collection["fields"]
-        image_name = COLLECTION_IMAGES[pk]
-        background_image = get_image(placeholder_dir, image_name)
-        defaults["background_image"] = background_image
+        image_name = COLLECTION_IMAGES.get(pk)
+        if image_name:
+            background_image = get_image(placeholder_dir, image_name)
+            defaults["background_image"] = background_image
         Collection.objects.update_or_create(pk=pk, defaults=defaults)
-        create_collection_background_image_thumbnails.delay(pk)
 
 
 def assign_products_to_collections(associations: list):
     for value in associations:
         pk = value["pk"]
-        defaults = value["fields"]
+        defaults = dict(value["fields"])
         defaults["collection_id"] = defaults.pop("collection")
         defaults["product_id"] = defaults.pop("product")
         CollectionProduct.objects.update_or_create(pk=pk, defaults=defaults)
@@ -253,7 +251,7 @@ def create_attributes(attributes_data):
 def create_attributes_values(values_data):
     for value in values_data:
         pk = value["pk"]
-        defaults = value["fields"]
+        defaults = dict(value["fields"])
         defaults["attribute_id"] = defaults.pop("attribute")
         AttributeValue.objects.update_or_create(pk=pk, defaults=defaults)
 
@@ -265,7 +263,7 @@ def create_products(products_data, placeholder_dir, create_images):
         if pk not in IMAGES_MAPPING:
             continue
 
-        defaults = product["fields"]
+        defaults = dict(product["fields"])
         defaults["weight"] = get_weight(defaults["weight"])
         defaults["category_id"] = defaults.pop("category")
         defaults["product_type_id"] = defaults.pop("product_type")
@@ -281,11 +279,11 @@ def create_products(products_data, placeholder_dir, create_images):
 
 
 def create_product_channel_listings(product_channel_listings_data):
-    channel_USD = Channel.objects.get(currency_code="USD")
-    channel_PLN = Channel.objects.get(currency_code="PLN")
+    channel_USD = Channel.objects.get(slug=settings.DEFAULT_CHANNEL_SLUG)
+    channel_PLN = Channel.objects.get(slug="channel-pln")
     for product_channel_listing in product_channel_listings_data:
         pk = product_channel_listing["pk"]
-        defaults = product_channel_listing["fields"]
+        defaults = dict(product_channel_listing["fields"])
         defaults["product_id"] = defaults.pop("product")
         channel = defaults.pop("channel")
         defaults["channel_id"] = channel_USD.pk if channel == 1 else channel_PLN.pk
@@ -305,7 +303,7 @@ def create_stocks(variant, warehouse_qs=None, **defaults):
 def create_product_variants(variants_data, create_images):
     for variant in variants_data:
         pk = variant["pk"]
-        defaults = variant["fields"]
+        defaults = dict(variant["fields"])
         defaults["weight"] = get_weight(defaults["weight"])
         product_id = defaults.pop("product")
         # We have not created products without images
@@ -328,11 +326,11 @@ def create_product_variants(variants_data, create_images):
 
 
 def create_product_variant_channel_listings(product_variant_channel_listings_data):
-    channel_USD = Channel.objects.get(currency_code="USD")
-    channel_PLN = Channel.objects.get(currency_code="PLN")
+    channel_USD = Channel.objects.get(slug=settings.DEFAULT_CHANNEL_SLUG)
+    channel_PLN = Channel.objects.get(slug="channel-pln")
     for variant_channel_listing in product_variant_channel_listings_data:
         pk = variant_channel_listing["pk"]
-        defaults = variant_channel_listing["fields"]
+        defaults = dict(variant_channel_listing["fields"])
 
         defaults["variant_id"] = defaults.pop("variant")
         channel = defaults.pop("channel")
@@ -346,19 +344,19 @@ def assign_attributes_to_product_types(
 ):
     for value in attributes:
         pk = value["pk"]
-        defaults = value["fields"]
+        defaults = dict(value["fields"])
         defaults["attribute_id"] = defaults.pop("attribute")
         defaults["product_type_id"] = defaults.pop("product_type")
         association_model.objects.update_or_create(pk=pk, defaults=defaults)
 
 
 def assign_attributes_to_page_types(
-    association_model: AttributePage,
+    association_model: Type[AttributePage],
     attributes: list,
 ):
     for value in attributes:
         pk = value["pk"]
-        defaults = value["fields"]
+        defaults = dict(value["fields"])
         defaults["attribute_id"] = defaults.pop("attribute")
         defaults["page_type_id"] = defaults.pop("page_type")
         association_model.objects.update_or_create(pk=pk, defaults=defaults)
@@ -367,35 +365,43 @@ def assign_attributes_to_page_types(
 def assign_attributes_to_products(product_attributes):
     for value in product_attributes:
         pk = value["pk"]
-        defaults = value["fields"]
+        defaults = dict(value["fields"])
         defaults["product_id"] = defaults.pop("product")
         defaults["assignment_id"] = defaults.pop("assignment")
-        assigned_values = defaults.pop("values")
-        assoc, created = AssignedProductAttribute.objects.update_or_create(
-            pk=pk, defaults=defaults
-        )
-        if created:
-            assoc.values.set(AttributeValue.objects.filter(pk__in=assigned_values))
+        AssignedProductAttribute.objects.update_or_create(pk=pk, defaults=defaults)
+
+
+def assign_attribute_values_to_products(values):
+    for value in values:
+        pk = value["pk"]
+        defaults = dict(value["fields"])
+        defaults["value_id"] = defaults.pop("value")
+        defaults["assignment_id"] = defaults.pop("assignment")
+        AssignedProductAttributeValue.objects.update_or_create(pk=pk, defaults=defaults)
 
 
 def assign_attributes_to_variants(variant_attributes):
     for value in variant_attributes:
         pk = value["pk"]
-        defaults = value["fields"]
+        defaults = dict(value["fields"])
         defaults["variant_id"] = defaults.pop("variant")
         defaults["assignment_id"] = defaults.pop("assignment")
-        assigned_values = defaults.pop("values")
-        assoc, created = AssignedVariantAttribute.objects.update_or_create(
-            pk=pk, defaults=defaults
-        )
-        if created:
-            assoc.values.set(AttributeValue.objects.filter(pk__in=assigned_values))
+        AssignedVariantAttribute.objects.update_or_create(pk=pk, defaults=defaults)
+
+
+def assign_attribute_values_to_variants(variant_attribute_values):
+    for value in variant_attribute_values:
+        pk = value["pk"]
+        defaults = dict(value["fields"])
+        defaults["value_id"] = defaults.pop("value")
+        defaults["assignment_id"] = defaults.pop("assignment")
+        AssignedVariantAttributeValue.objects.update_or_create(pk=pk, defaults=defaults)
 
 
 def assign_attributes_to_pages(page_attributes):
     for value in page_attributes:
         pk = value["pk"]
-        defaults = value["fields"]
+        defaults = dict(value["fields"])
         defaults["page_id"] = defaults.pop("page")
         defaults["assignment_id"] = defaults.pop("assignment")
         assigned_values = defaults.pop("values")
@@ -413,16 +419,7 @@ def set_field_as_money(defaults, field):
 
 
 def create_products_by_schema(placeholder_dir, create_images):
-    path = os.path.join(
-        settings.PROJECT_ROOT, "saleor", "static", "populatedb_data.json"
-    )
-    with open(path) as f:
-        db_items = json.load(f)
-    types = defaultdict(list)
-    # Sort db objects by its model
-    for item in db_items:
-        model = item.pop("model")
-        types[model].append(item)
+    types = get_sample_data()
 
     create_product_types(product_type_data=types["product.producttype"])
     create_categories(
@@ -430,6 +427,7 @@ def create_products_by_schema(placeholder_dir, create_images):
     )
     create_attributes(attributes_data=types["attribute.attribute"])
     create_attributes_values(values_data=types["attribute.attributevalue"])
+
     create_products(
         products_data=types["product.product"],
         placeholder_dir=placeholder_dir,
@@ -458,8 +456,14 @@ def create_products_by_schema(placeholder_dir, create_images):
     assign_attributes_to_products(
         product_attributes=types["attribute.assignedproductattribute"]
     )
+    assign_attribute_values_to_products(
+        types["attribute.assignedproductattributevalue"]
+    )
     assign_attributes_to_variants(
         variant_attributes=types["attribute.assignedvariantattribute"]
+    )
+    assign_attribute_values_to_variants(
+        types["attribute.assignedvariantattributevalue"]
     )
     assign_attributes_to_pages(page_attributes=types["attribute.assignedpageattribute"])
     create_collections(
@@ -470,7 +474,9 @@ def create_products_by_schema(placeholder_dir, create_images):
     )
     assign_products_to_collections(associations=types["product.collectionproduct"])
 
-    update_products_search_document(Product.objects.all())
+    all_products_qs = Product.objects.all()
+    update_products_search_vector(all_products_qs)
+    update_products_discounted_prices(all_products_qs)
 
 
 class SaleorProvider(BaseProvider):
@@ -481,16 +487,15 @@ class SaleorProvider(BaseProvider):
         return Weight(kg=fake.pydecimal(1, 2, positive=True))
 
 
-fake.add_provider(SaleorProvider)  # type: ignore
+fake.add_provider(SaleorProvider)
 
 
 def get_email(first_name, last_name):
     _first = unicodedata.normalize("NFD", first_name).encode("ascii", "ignore")
     _last = unicodedata.normalize("NFD", last_name).encode("ascii", "ignore")
-    return "%s.%s@example.com" % (
-        _first.lower().decode("utf-8"),
-        _last.lower().decode("utf-8"),
-    )
+    decoded_first = _first.lower().decode("utf-8")
+    decoded_last = _last.lower().decode("utf-8")
+    return f"{decoded_first}.{decoded_last}@example.com"
 
 
 def create_product_image(product, placeholder_dir, image_name):
@@ -500,7 +505,6 @@ def create_product_image(product, placeholder_dir, image_name):
         return None
     product_image = ProductMedia(product=product, image=image)
     product_image.save()
-    create_product_thumbnails.delay(product_image.pk)
     return product_image
 
 
@@ -515,7 +519,7 @@ def create_address(save=True, **kwargs):
     )
 
     if address.country == "US":
-        state = fake.state_abbr()
+        state = fake.state_abbr(include_territories=False)
         address.country_area = state
         address.postal_code = fake.postalcode_in_state(state)
     else:
@@ -536,8 +540,11 @@ def create_fake_user(user_password, save=True):
     except User.DoesNotExist:
         pass
 
+    _, max_user_id = connection.ops.integer_field_range(
+        User.id.field.get_internal_type()  # type: ignore # raw access to field
+    )
     user = User(
-        id=fake.numerify(),
+        id=fake.random_int(min=1, max=max_user_id),
         first_name=address.first_name,
         last_name=address.last_name,
         email=email,
@@ -612,7 +619,7 @@ def create_order_lines(order, discounts, how_many=10):
     ).order_by("?")
     warehouse_iter = itertools.cycle(warehouses)
     for line in lines:
-        variant = line.variant
+        variant = cast(ProductVariant, line.variant)
         unit_price_data = manager.calculate_order_line_unit(
             order, line, variant, variant.product
         )
@@ -666,7 +673,7 @@ def create_order_lines_with_preorder(order, discounts, how_many=1):
 
     preorder_allocations = []
     for line in lines:
-        variant = line.variant
+        variant = cast(ProductVariant, line.variant)
         unit_price_data = manager.calculate_order_line_unit(
             order, line, variant, variant.product
         )
@@ -716,16 +723,16 @@ def _get_new_order_line(order, variant, channel, discounts):
         or variant.preorder_global_threshold
         or 5,
     )
-    unit_price = variant.get_price(
+    untaxed_unit_price = variant.get_price(
         product,
         product.collections.all(),
         channel,
         variant_channel_listing,
         discounts,
     )
-    unit_price = TaxedMoney(net=unit_price, gross=unit_price)
+    unit_price = TaxedMoney(net=untaxed_unit_price, gross=untaxed_unit_price)
     total_price = unit_price * quantity
-    return OrderLine(
+    return OrderLine(  # type: ignore[misc] # see below:
         order=order,
         product_name=str(product),
         variant_name=str(variant),
@@ -735,11 +742,14 @@ def _get_new_order_line(order, variant, channel, discounts):
         is_gift_card=variant.is_gift_card(),
         quantity=quantity,
         variant=variant,
-        unit_price=unit_price,
-        total_price=total_price,
-        undiscounted_unit_price=unit_price,
-        undiscounted_total_price=total_price,
+        unit_price=unit_price,  # money field not supported by mypy_django_plugin
+        total_price=total_price,  # money field not supported by mypy_django_plugin
+        undiscounted_unit_price=unit_price,  # money field not supported by mypy_django_plugin # noqa: E501
+        undiscounted_total_price=total_price,  # money field not supported by mypy_django_plugin # noqa: E501
+        base_unit_price=untaxed_unit_price,  # money field not supported by mypy_django_plugin # noqa: E501
+        undiscounted_base_unit_price=untaxed_unit_price,  # money field not supported by mypy_django_plugin # noqa: E501
         tax_rate=0,
+        **get_tax_class_kwargs_for_order_line(product.tax_class),
     )
 
 
@@ -762,7 +772,13 @@ def create_fulfillments(order):
 
 
 def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False):
-    channel = Channel.objects.all().order_by("?").first()
+    channel = (
+        Channel.objects.filter(slug__in=[settings.DEFAULT_CHANNEL_SLUG, "channel-pln"])
+        .order_by("?")
+        .first()
+    )
+    if not channel:
+        raise ValueError("No channel found.")
     customers = (
         User.objects.filter(is_superuser=False)
         .exclude(default_billing_address=None)
@@ -775,26 +791,27 @@ def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False)
         random.choice([0, 0, 0, 0, 1]) if not create_preorder_lines else True
     )
 
-    if customer:
+    if customer and customer.default_shipping_address:
         address = customer.default_shipping_address
-        order_data = {
-            "user": customer,
-            "billing_address": customer.default_billing_address,
-            "shipping_address": address,
-        }
     else:
         address = create_address()
-        order_data = {
-            "billing_address": address,
-            "shipping_address": address,
-            "user_email": get_email(address.first_name, address.last_name),
-        }
+    if customer and customer.default_billing_address:
+        billing_address = customer.default_billing_address
+    else:
+        billing_address = address
+    order_data: Dict[str, Any] = {
+        "billing_address": billing_address or address,
+        "shipping_address": address,
+        "user_email": get_email(address.first_name, address.last_name),
+    }
 
     shipping_method_channel_listing = (
         ShippingMethodChannelListing.objects.filter(channel=channel)
         .order_by("?")
         .first()
     )
+    if not shipping_method_channel_listing:
+        raise Exception(f"No shipping method found for channel {channel.slug}")
     shipping_method = shipping_method_channel_listing.shipping_method
     shipping_price = shipping_method_channel_listing.price
     shipping_price = TaxedMoney(net=shipping_price, gross=shipping_price)
@@ -804,6 +821,7 @@ def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False)
             "shipping_method": shipping_method,
             "shipping_method_name": shipping_method.name,
             "shipping_price": shipping_price,
+            "base_shipping_price": shipping_method_channel_listing.price,
         }
     )
     if will_be_unconfirmed:
@@ -819,9 +837,12 @@ def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False)
     order.total = sum([line.total_price for line in lines], shipping_price)
     weight = Weight(kg=0)
     for line in order.lines.all():
-        weight += line.variant.get_weight()
+        if line.variant:
+            weight += line.variant.get_weight()
     order.weight = weight
-    order.search_document = prepare_order_search_document_value(order)
+    order.search_vector = FlatConcatSearchVector(
+        *prepare_order_search_vector_value(order)
+    )
     order.save()
 
     create_fake_payment(order=order)
@@ -834,7 +855,7 @@ def create_fake_order(discounts, max_order_lines=5, create_preorder_lines=False)
 
 def create_fake_sale():
     sale = Sale.objects.create(
-        name="Happy %s day!" % fake.word(),
+        name=f"Happy {fake.word()} day!",
         type=DiscountValueType.PERCENTAGE,
     )
     for channel in Channel.objects.all():
@@ -844,7 +865,7 @@ def create_fake_sale():
             sale=sale,
             discount_value=random.choice([10, 20, 30, 40, 50]),
         )
-    for product in Product.objects.all().order_by("?")[:4]:
+    for product in Product.objects.all().order_by("?")[:2]:
         sale.products.add(product)
 
     for variant in ProductVariant.objects.all().order_by("?")[:2]:
@@ -855,7 +876,7 @@ def create_fake_sale():
 def create_users(user_password, how_many=10):
     for _ in range(how_many):
         user = create_fake_user(user_password)
-        yield "User: %s" % (user.email,)
+        yield f"User: {user.email}"
 
 
 def create_permission_groups(staff_password):
@@ -906,14 +927,15 @@ def create_group(name, permissions, users):
 
 
 def _create_staff_user(staff_password, email=None, superuser=False):
-    user = User.objects.filter(email=email).first()
-    if user:
-        return user
     address = create_address()
     first_name = address.first_name
     last_name = address.last_name
     if not email:
         email = get_email(first_name, last_name)
+
+    staff_user = User.objects.filter(email=email).first()
+    if staff_user:
+        return staff_user
 
     staff_user = User.objects.create_user(
         first_name=first_name,
@@ -929,6 +951,7 @@ def _create_staff_user(staff_password, email=None, superuser=False):
             User(email=email, first_name=first_name, last_name=last_name), address
         ),
     )
+    staff_user.addresses.add(address)
     return staff_user
 
 
@@ -950,21 +973,14 @@ def create_orders(how_many=10):
     discounts = fetch_discounts(timezone.now())
     for _ in range(how_many):
         order = create_fake_order(discounts)
-        yield "Order: %s" % (order,)
-
-
-def create_preorder_orders(how_many=1):
-    discounts = fetch_discounts(timezone.now())
-    for _ in range(how_many):
-        order = create_fake_order(discounts, create_preorder_lines=True)
-        yield "Order: %s" % (order,)
+        yield f"Order: {order}"
 
 
 def create_product_sales(how_many=5):
     for _ in range(how_many):
         sale = create_fake_sale()
         update_products_discounted_prices_of_discount_task.delay(sale.pk)
-        yield "Sale: %s" % (sale,)
+        yield f"Sale: {sale}"
 
 
 def create_channel(channel_name, currency_code, slug=None, country=None):
@@ -979,6 +995,7 @@ def create_channel(channel_name, currency_code, slug=None, country=None):
             "default_country": country,
         },
     )
+    TaxConfiguration.objects.get_or_create(channel=channel)
     return f"Channel: {channel}"
 
 
@@ -989,7 +1006,12 @@ def create_channels():
         slug=settings.DEFAULT_CHANNEL_SLUG,
         country=settings.DEFAULT_COUNTRY,
     )
-    yield create_channel(channel_name="Channel-PLN", currency_code="PLN", country="PL")
+    yield create_channel(
+        channel_name="Channel-PLN",
+        currency_code="PLN",
+        slug="channel-pln",
+        country="PL",
+    )
 
 
 def create_shipping_zone(shipping_methods_names, countries, shipping_zone_name):
@@ -1323,7 +1345,12 @@ def create_shipping_zones():
 
 
 def create_additional_cc_warehouse():
+    channel = Channel.objects.first()
+    if not channel:
+        raise Exception("No channels found")
     shipping_zone = ShippingZone.objects.first()
+    if not shipping_zone:
+        raise Exception("No shipping zones found")
     warehouse_name = f"{shipping_zone.name} for click and collect"
     warehouse, _ = Warehouse.objects.update_or_create(
         name=warehouse_name,
@@ -1335,9 +1362,11 @@ def create_additional_cc_warehouse():
         },
     )
     warehouse.shipping_zones.add(shipping_zone)
+    warehouse.channels.add(channel)
 
 
 def create_warehouses():
+    channels = Channel.objects.all()
     for shipping_zone in ShippingZone.objects.all():
         shipping_zone_name = shipping_zone.name
         is_private = random.choice([True, False])
@@ -1360,6 +1389,7 @@ def create_warehouses():
             },
         )
         warehouse.shipping_zones.add(shipping_zone)
+        warehouse.channels.add(*channels)
 
     create_additional_cc_warehouse()
 
@@ -1433,7 +1463,10 @@ def create_vouchers():
 
 
 def create_gift_cards(how_many=5):
-    product_pk = Product.objects.get(name="Gift card").pk
+    product = Product.objects.filter(name="Gift card 100").first()
+    if not product:
+        return
+    product_pk = product.pk
     tag, _ = GiftCardTag.objects.get_or_create(name="issued-gift-cards")
     for i in range(how_many):
         staff_user = User.objects.filter(is_staff=True).order_by("?").first()
@@ -1462,8 +1495,10 @@ def create_gift_cards(how_many=5):
                 "current_balance": Money(20, DEFAULT_CURRENCY),
             },
         )
-        order_id = Order.objects.order_by("?").first().id
-        gift_card_events.gift_cards_bought_event([gift_card], order_id, user, None)
+        order = Order.objects.order_by("?").first()
+        if not order:
+            raise Exception("No orders found")
+        gift_card_events.gift_cards_bought_event([gift_card], order, user, None)
         if created:
             yield "Gift card #%d" % gift_card.id
         else:
@@ -1479,196 +1514,54 @@ def add_address_to_admin(email):
 
 
 def create_page_type():
-    data = [
-        {
-            "pk": 1,
-            "fields": {
-                "private_metadata": {},
-                "metadata": {},
-                "name": "About",
-                "slug": "about",
-            },
-        },
-        {
-            "pk": 2,
-            "fields": {
-                "private_metadata": {},
-                "metadata": {},
-                "name": "Mission",
-                "slug": "mission",
-            },
-        },
-        {
-            "pk": 3,
-            "fields": {
-                "private_metadata": {},
-                "metadata": {},
-                "name": "Product details",
-                "slug": "product-details",
-            },
-        },
-    ]
+    types = get_sample_data()
+
+    data = types["page.pagetype"]
+
     for page_type_data in data:
         pk = page_type_data.pop("pk")
-        page_type, _ = PageType.objects.update_or_create(
-            pk=pk, **page_type_data["fields"]
-        )
-        yield "Page type %s created" % page_type.slug
+        defaults = dict(page_type_data["fields"])
+        page_type, _ = PageType.objects.update_or_create(pk=pk, defaults=defaults)
+        yield f"Page type {page_type.slug} created"
 
 
 def create_pages():
-    data_pages = {
-        1: {
-            "title": "About",
-            "slug": "about",
-            "page_type_id": 1,
-            "content": {
-                "blocks": [
-                    {
-                        "data": {"text": "E-commerce for the PWA era", "level": 2},
-                        "type": "header",
-                    },
-                    {
-                        "data": {
-                            "text": (
-                                "A modular, high performance e-commerce storefront "
-                                "built with GraphQL, Django, and ReactJS."
-                            ),
-                            "level": 2,
-                        },
-                        "type": "header",
-                    },
-                    {"data": {"text": ""}, "type": "paragraph"},
-                    {
-                        "data": {
-                            "text": (
-                                "Saleor is a rapidly-growing open source e-commerce "
-                                "platform that has served high-volume companies "
-                                "from branches like publishing and apparel since 2012. "
-                                "Based on Python and Django, the latest major update "
-                                "introduces a modular front end with a GraphQL API "
-                                "and storefront and dashboard written in React "
-                                "to make Saleor a full-functionality "
-                                "open source e-commerce."
-                            )
-                        },
-                        "type": "paragraph",
-                    },
-                    {"data": {"text": ""}, "type": "paragraph"},
-                    {
-                        "data": {
-                            "text": (
-                                '<a href="https://github.com/mirumee/saleor">'
-                                "Get Saleor today!</a>"
-                            )
-                        },
-                        "type": "paragraph",
-                    },
-                ],
-            },
-        },
-        2: {
-            "title": "Apple juice details",
-            "slug": "apple-juice-details",
-            "page_type_id": 3,
-            "content": {
-                "blocks": [
-                    {
-                        "data": {"text": "Apple juice details", "level": 2},
-                        "type": "header",
-                    },
-                    {
-                        "data": {"text": "This is example product details page."},
-                        "type": "paragraph",
-                    },
-                ]
-            },
-        },
-    }
+    types = get_sample_data()
 
-    for pk in [1, 2]:
-        data = data_pages[pk]
-        page_data = {
-            "content": data["content"],
-            "title": data["title"],
-            "is_published": True,
-            "page_type_id": data["page_type_id"],
-        }
-        page, _ = Page.objects.get_or_create(
-            pk=pk, slug=data["slug"], defaults=page_data
-        )
-        yield "Page %s created" % page.slug
+    data_pages = types["page.page"]
 
-
-def generate_menu_items(menu: Menu, category: Category, parent_menu_item):
-    menu_item, created = menu.items.get_or_create(
-        name=category.name, category=category, parent=parent_menu_item
-    )
-
-    if created:
-        yield "Created menu item for category %s" % category
-
-    for child in category.get_children():
-        for msg in generate_menu_items(menu, child, menu_item):
-            yield "\t%s" % msg
-
-
-def generate_menu_tree(menu):
-    categories = (
-        Category.tree.get_queryset()
-        .filter(
-            Q(parent__isnull=True) & Q(products__isnull=False)
-            | Q(children__products__isnull=False)
-        )
-        .distinct()
-    )
-
-    for category in categories:
-        for msg in generate_menu_items(menu, category, None):
-            yield msg
+    for page_data in data_pages:
+        pk = page_data["pk"]
+        defaults = dict(page_data["fields"])
+        defaults["page_type_id"] = defaults.pop("page_type")
+        page, _ = Page.objects.update_or_create(pk=pk, defaults=defaults)
+        yield f"Page {page.slug} created"
 
 
 def create_menus():
-    # Create navbar menu with category links
-    top_menu, _ = Menu.objects.get_or_create(
-        name=settings.DEFAULT_MENUS["top_menu_name"]
-    )
-    top_menu.items.all().delete()
-    yield "Created navbar menu"
-    for msg in generate_menu_tree(top_menu):
-        yield msg
+    types = get_sample_data()
 
-    # Create footer menu with collections and pages
-    bottom_menu, _ = Menu.objects.get_or_create(
-        name=settings.DEFAULT_MENUS["bottom_menu_name"]
-    )
-    bottom_menu.items.all().delete()
-    collection = Collection.objects.filter(products__isnull=False).order_by("?")[0]
-    item, _ = bottom_menu.items.get_or_create(name="Collections", collection=collection)
-
-    for collection in Collection.objects.filter(
-        products__isnull=False, background_image__isnull=False
-    ):
-        bottom_menu.items.get_or_create(
-            name=collection.name, collection=collection, parent=item
-        )
-
-    item_saleor = bottom_menu.items.get_or_create(name="Saleor", url="/")[0]
-
-    page = Page.objects.order_by("?")[0]
-    item_saleor.children.get_or_create(name=page.title, page=page, menu=bottom_menu)
-
-    api_url = build_absolute_uri(reverse("api"))
-    item_saleor.children.get_or_create(
-        name="GraphQL API", url=api_url, menu=bottom_menu
-    )
-
-    yield "Created footer menu"
-    site = Site.objects.get_current()
-    site_settings = site.settings
-    site_settings.top_menu = top_menu
-    site_settings.bottom_menu = bottom_menu
-    site_settings.save()
+    menu_data = types["menu.menu"]
+    menu_item_data = types["menu.menuitem"]
+    for menu in menu_data:
+        pk = menu["pk"]
+        defaults = menu["fields"]
+        menu, _ = Menu.objects.update_or_create(pk=pk, defaults=defaults)
+        yield f"Menu {menu.name} created"
+    for menu_item in menu_item_data:
+        pk = menu_item["pk"]
+        defaults = dict(menu_item["fields"])
+        defaults["category_id"] = defaults.pop("category")
+        defaults["collection_id"] = defaults.pop("collection")
+        defaults["menu_id"] = defaults.pop("menu")
+        defaults["page_id"] = defaults.pop("page")
+        defaults.pop("parent")
+        menu_item, _ = MenuItem.objects.update_or_create(pk=pk, defaults=defaults)
+        yield f"MenuItem {menu_item.name} created"
+    for menu_item in menu_item_data:
+        pk = menu_item["pk"]
+        defaults = dict(menu_item["fields"])
+        MenuItem.objects.filter(pk=pk).update(parent_id=defaults["parent"])
 
 
 def get_product_list_images_dir(placeholder_dir):
@@ -1681,11 +1574,16 @@ def get_image(image_dir, image_name):
     return File(open(img_path, "rb"), name=image_name)
 
 
-def create_checkout_with_preorders():
-    channel = Channel.objects.get(currency_code="USD")
+def prepare_checkout_info():
+    channel = Channel.objects.get(slug=settings.DEFAULT_CHANNEL_SLUG)
     checkout = Checkout.objects.create(currency=channel.currency_code, channel=channel)
     checkout.set_country(channel.default_country, commit=True)
     checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
+    return checkout_info
+
+
+def create_checkout_with_preorders():
+    checkout_info = prepare_checkout_info()
     for product_variant in ProductVariant.objects.all()[:2]:
         product_variant.is_preorder = True
         product_variant.preorder_global_threshold = 10
@@ -1695,7 +1593,44 @@ def create_checkout_with_preorders():
                 "is_preorder",
                 "preorder_global_threshold",
                 "preorder_end_date",
+                "updated_at",
             ]
         )
         add_variant_to_checkout(checkout_info, product_variant, 2)
-    yield f"Created checkout with two preorders. Checkout token: {checkout.token}"
+    yield (
+        "Created checkout with two preorders. Checkout token: "
+        f"{checkout_info.checkout.token}"
+    )
+
+
+def create_checkout_with_custom_prices():
+    checkout_info = prepare_checkout_info()
+    for product_variant in ProductVariant.objects.all()[:2]:
+        add_variant_to_checkout(
+            checkout_info, product_variant, 2, price_override=Decimal("20.0")
+        )
+    yield (
+        "Created checkout with two lines and custom prices. "
+        f"Checkout token: {checkout_info.checkout.token}."
+    )
+
+
+def create_checkout_with_same_variant_in_multiple_lines():
+    checkout_info = prepare_checkout_info()
+    for product_variant in ProductVariant.objects.all()[:2]:
+        add_variant_to_checkout(checkout_info, product_variant, 2)
+        add_variant_to_checkout(checkout_info, product_variant, 2, force_new_line=True)
+
+    yield (
+        "Created checkout with four lines and same variant in multiple lines "
+        f"Checkout token: {checkout_info.checkout.token}."
+    )
+
+
+def create_tax_classes():
+    names = ["Groceries", "Books"]
+    tax_classes = []
+    for name in names:
+        tax_classes.append(TaxClass(name=name))
+    TaxClass.objects.bulk_create(tax_classes)
+    yield f"Created tax classes: {names}"

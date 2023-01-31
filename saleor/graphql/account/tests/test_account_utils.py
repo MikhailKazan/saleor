@@ -1,8 +1,6 @@
-from django.contrib.auth.models import Group
-
-from ....account.models import User
+from ....account.models import Group, User
 from ....app.models import App
-from ....core.permissions import (
+from ....permission.enums import (
     AccountPermissions,
     OrderPermissions,
     ProductPermissions,
@@ -21,8 +19,8 @@ from ..utils import (
     get_out_of_scope_users,
     get_user_permissions,
     get_users_and_look_for_permissions_in_groups_with_manage_staff,
+    is_owner_or_has_one_of_perms,
     look_for_permission_in_users_with_manage_staff,
-    requestor_has_access,
 )
 
 
@@ -738,8 +736,7 @@ def test_get_not_manageable_permissions_after_removing_perms_from_group_no_perms
     permission_manage_staff,
     permission_manage_orders,
 ):
-    """Ensure no permissions are returned when all perms will be manageable after removing
-    permissions from group."""
+    """Ensure no permissions are lost when after removing permissions from group."""
     groups = Group.objects.bulk_create(
         [
             Group(name="manage users and products"),
@@ -855,7 +852,7 @@ def test_can_manage_app_for_app(
 
 def test_requestor_has_access_no_access_by_customer(staff_user, customer_user):
     # when
-    result = requestor_has_access(
+    result = is_owner_or_has_one_of_perms(
         customer_user, staff_user, OrderPermissions.MANAGE_ORDERS
     )
 
@@ -865,7 +862,7 @@ def test_requestor_has_access_no_access_by_customer(staff_user, customer_user):
 
 def test_requestor_has_access_access_by_customer(customer_user):
     # when
-    result = requestor_has_access(
+    result = is_owner_or_has_one_of_perms(
         customer_user, customer_user, OrderPermissions.MANAGE_ORDERS
     )
 
@@ -881,7 +878,7 @@ def test_requestor_has_access_access_by_staff(
     staff_user.save()
 
     # when
-    result = requestor_has_access(
+    result = is_owner_or_has_one_of_perms(
         staff_user, customer_user, OrderPermissions.MANAGE_ORDERS
     )
 
@@ -897,7 +894,7 @@ def test_requestor_has_access_no_access_by_staff(
     staff_user.save()
 
     # when
-    result = requestor_has_access(
+    result = is_owner_or_has_one_of_perms(
         staff_user, customer_user, OrderPermissions.MANAGE_ORDERS
     )
 

@@ -1,16 +1,20 @@
 from collections import defaultdict
+from typing import DefaultDict, Iterable, List, Tuple, cast
 
 from django.db.models import F
 
 from ...order.models import Fulfillment, FulfillmentLine, Order, OrderEvent, OrderLine
+from ...payment.models import TransactionItem
 from ...warehouse.models import Allocation
 from ..core.dataloaders import DataLoader
 
 
-class OrderLinesByVariantIdAndChannelIdLoader(DataLoader):
+class OrderLinesByVariantIdAndChannelIdLoader(
+    DataLoader[Tuple[int, int], List[OrderLine]]
+):
     context_key = "orderline_by_variant_and_channel"
 
-    def batch_load(self, keys):
+    def batch_load(self, keys: Iterable[Tuple[int, int]]):
         channel_ids = [key[1] for key in keys]
         variant_ids = [key[0] for key in keys]
         order_lines = (
@@ -19,9 +23,14 @@ class OrderLinesByVariantIdAndChannelIdLoader(DataLoader):
             .annotate(channel_id=F("order__channel_id"))
         )
 
-        order_line_by_variant_and_channel_map = defaultdict(list)
+        order_line_by_variant_and_channel_map: DefaultDict[
+            Tuple[int, int], List[OrderLine]
+        ] = defaultdict(list)
         for order_line in order_lines:
-            key = (order_line.variant_id, order_line.channel_id)
+            key = (
+                cast(int, order_line.variant_id),
+                getattr(order_line, "channel_id", 0),  # annotation
+            )
             order_line_by_variant_and_channel_map[key].append(order_line)
         return [order_line_by_variant_and_channel_map[key] for key in keys]
 
@@ -64,7 +73,7 @@ class OrderLinesByOrderIdLoader(DataLoader):
         lines = (
             OrderLine.objects.using(self.database_connection_name)
             .filter(order_id__in=keys)
-            .order_by("pk")
+            .order_by("created_at")
         )
         line_map = defaultdict(list)
         for line in lines.iterator():
@@ -125,3 +134,39 @@ class FulfillmentLinesByIdLoader(DataLoader):
             self.database_connection_name
         ).in_bulk(keys)
         return [fulfillment_lines.get(line_id) for line_id in keys]
+
+
+class FulfillmentLinesByFulfillmentIdLoader(DataLoader):
+    context_key = "fulfillment_lines_by_fulfillment_id"
+
+    def batch_load(self, keys):
+        fulfillment_lines = (
+            FulfillmentLine.objects.using(self.database_connection_name)
+            .filter(fulfillment_id__in=keys)
+            .order_by("pk")
+        )
+        fulfillment_lines_map = defaultdict(list)
+
+        for fulfillment_line in fulfillment_lines:
+            fulfillment_lines_map[fulfillment_line.fulfillment_id].append(
+                fulfillment_line
+            )
+
+        return [
+            fulfillment_lines_map.get(fulfillment_id, []) for fulfillment_id in keys
+        ]
+
+
+class TransactionItemsByOrderIDLoader(DataLoader):
+    context_key = "transaction_items_by_order_id"
+
+    def batch_load(self, keys):
+        transactions = (
+            TransactionItem.objects.using(self.database_connection_name)
+            .filter(order_id__in=keys)
+            .order_by("pk")
+        )
+        transactions_map = defaultdict(list)
+        for transaction in transactions:
+            transactions_map[transaction.order_id].append(transaction)
+        return [transactions_map.get(order_id, []) for order_id in keys]

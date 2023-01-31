@@ -1,4 +1,4 @@
-import secrets
+import uuid
 from datetime import date, datetime
 from tempfile import NamedTemporaryFile
 from typing import IO, TYPE_CHECKING, Any, Dict, List, Set, Union
@@ -14,7 +14,6 @@ from .product_headers import get_product_export_fields_and_headers_info
 from .products_data import get_products_data
 
 if TYPE_CHECKING:
-    # flake8: noqa
     from django.db.models import QuerySet
 
     from ..models import ExportFile
@@ -91,7 +90,7 @@ def export_gift_cards(
 
 
 def get_filename(model_name: str, file_type: str) -> str:
-    hash = secrets.token_hex(nbytes=3)
+    hash = uuid.uuid4()
     return "{}_data_{}_{}.{}".format(
         model_name, timezone.now().strftime("%d_%m_%Y_%H_%M_%S"), hash, file_type
     )
@@ -110,7 +109,10 @@ def get_queryset(model, filter, scope: Dict[str, Union[str, dict]]) -> "QuerySet
 
 
 def parse_input(data: Any) -> Dict[str, Union[str, dict]]:
-    """Parse input to correct data types, since scope coming from celery will be parsed to strings."""
+    """Parse input into correct data types.
+
+    Scope coming from Celery will be passed as strings.
+    """
     if "attributes" in data:
         serialized_attributes = []
 
@@ -201,7 +203,7 @@ def queryset_in_batches(queryset):
     start_pk = 0
 
     while True:
-        qs = queryset.filter(pk__gt=start_pk)[:BATCH_SIZE]
+        qs = queryset.order_by("pk").filter(pk__gt=start_pk)[:BATCH_SIZE]
         pks = list(qs.values_list("pk", flat=True))
 
         if not pks:

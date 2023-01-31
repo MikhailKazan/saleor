@@ -1,4 +1,7 @@
+from datetime import timedelta
+
 import pytest
+from django.utils import timezone
 from measurement.measures import Weight
 from prices import Money, TaxedMoney
 
@@ -35,7 +38,7 @@ def test_adding_same_variant(checkout, product):
     checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
     add_variant_to_checkout(checkout_info, variant, 1)
     add_variant_to_checkout(checkout_info, variant, 2)
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_quantity = calculate_checkout_quantity(lines)
     assert checkout.lines.count() == 1
     assert checkout_quantity == 3
@@ -59,7 +62,7 @@ def test_replacing_same_variant(checkout, product):
     checkout_info = fetch_checkout_info(checkout, [], [], get_plugins_manager())
     add_variant_to_checkout(checkout_info, variant, 1, replace=True)
     add_variant_to_checkout(checkout_info, variant, 2, replace=True)
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     assert checkout.lines.count() == 1
     assert calculate_checkout_quantity(lines) == 2
 
@@ -88,9 +91,11 @@ def test_shipping_detection(checkout, product):
 
 
 def test_get_prices_of_discounted_specific_product(
-    checkout_with_item, collection, voucher_specific_product_type
+    priced_checkout_with_item,
+    collection,
+    voucher_specific_product_type,
 ):
-    checkout = checkout_with_item
+    checkout = priced_checkout_with_item
     voucher = voucher_specific_product_type
     line = checkout.lines.first()
     product = line.variant.product
@@ -104,26 +109,28 @@ def test_get_prices_of_discounted_specific_product(
     voucher.categories.add(category)
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     prices = utils.get_prices_of_discounted_specific_product(
         manager, checkout_info, lines, voucher
     )
 
-    excepted_value = [
+    expected_value = [
         line.variant.get_price(
             product, [collection], channel, variant_channel_listing, []
         )
         for item in range(line.quantity)
     ]
 
-    assert prices == excepted_value
+    assert prices == expected_value
 
 
 def test_get_prices_of_discounted_specific_product_only_product(
-    checkout_with_item, voucher_specific_product_type, product_with_default_variant
+    priced_checkout_with_item,
+    voucher_specific_product_type,
+    product_with_default_variant,
 ):
-    checkout = checkout_with_item
+    checkout = priced_checkout_with_item
     voucher = voucher_specific_product_type
     line = checkout.lines.first()
     product = line.variant.product
@@ -135,28 +142,31 @@ def test_get_prices_of_discounted_specific_product_only_product(
     checkout_info = fetch_checkout_info(checkout, [], [], manager)
     add_variant_to_checkout(checkout_info, product2.variants.get(), 1)
     voucher.products.add(product)
+    # assume that cache is correct
+    checkout.price_expiration = timezone.now() + timedelta(days=1)
+    checkout.save()
 
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     prices = utils.get_prices_of_discounted_specific_product(
         manager, checkout_info, lines, voucher
     )
 
-    excepted_value = [
+    expected_value = [
         line.variant.get_price(product, [], channel, variant_channel_listing, [])
         for item in range(line.quantity)
     ]
 
     assert checkout.lines.count() > 1
-    assert prices == excepted_value
+    assert prices == expected_value
 
 
 def test_get_prices_of_discounted_specific_product_only_collection(
-    checkout_with_item,
+    priced_checkout_with_item,
     collection,
     voucher_specific_product_type,
     product_with_default_variant,
 ):
-    checkout = checkout_with_item
+    checkout = priced_checkout_with_item
     voucher = voucher_specific_product_type
     line = checkout.lines.first()
     product = line.variant.product
@@ -169,13 +179,16 @@ def test_get_prices_of_discounted_specific_product_only_collection(
     add_variant_to_checkout(checkout_info, product2.variants.get(), 1)
     product.collections.add(collection)
     voucher.collections.add(collection)
+    # assume that cache is correct
+    checkout.price_expiration = timezone.now() + timedelta(days=1)
+    checkout.save()
 
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     prices = utils.get_prices_of_discounted_specific_product(
         manager, checkout_info, lines, voucher
     )
 
-    excepted_value = [
+    expected_value = [
         line.variant.get_price(
             product, [collection], channel, variant_channel_listing, []
         )
@@ -183,13 +196,15 @@ def test_get_prices_of_discounted_specific_product_only_collection(
     ]
 
     assert checkout.lines.count() > 1
-    assert prices == excepted_value
+    assert prices == expected_value
 
 
 def test_get_prices_of_discounted_specific_product_only_category(
-    checkout_with_item, voucher_specific_product_type, product_with_default_variant
+    priced_checkout_with_item,
+    voucher_specific_product_type,
+    product_with_default_variant,
 ):
-    checkout = checkout_with_item
+    checkout = priced_checkout_with_item
     voucher = voucher_specific_product_type
     line = checkout.lines.first()
     product = line.variant.product
@@ -205,25 +220,29 @@ def test_get_prices_of_discounted_specific_product_only_category(
     checkout_info = fetch_checkout_info(checkout, [], [], manager)
     add_variant_to_checkout(checkout_info, product2.variants.get(), 1)
     voucher.categories.add(category)
+    # assume that cache is correct
+    checkout.price_expiration = timezone.now() + timedelta(days=1)
+    checkout.save()
 
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     prices = utils.get_prices_of_discounted_specific_product(
         manager, checkout_info, lines, voucher
     )
 
-    excepted_value = [
+    expected_value = [
         line.variant.get_price(product, [], channel, variant_channel_listing, [])
         for item in range(line.quantity)
     ]
 
     assert checkout.lines.count() > 1
-    assert prices == excepted_value
+    assert prices == expected_value
 
 
 def test_get_prices_of_discounted_specific_product_all_products(
-    checkout_with_item, voucher_specific_product_type
+    priced_checkout_with_item,
+    voucher_specific_product_type,
 ):
-    checkout = checkout_with_item
+    checkout = priced_checkout_with_item
     voucher = voucher_specific_product_type
     line = checkout.lines.first()
     product = line.variant.product
@@ -231,18 +250,18 @@ def test_get_prices_of_discounted_specific_product_all_products(
     variant_channel_listing = line.variant.channel_listings.get(channel=channel)
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     prices = utils.get_prices_of_discounted_specific_product(
         manager, checkout_info, lines, voucher
     )
 
-    excepted_value = [
+    expected_value = [
         line.variant.get_price(product, [], channel, variant_channel_listing, [])
         for item in range(line.quantity)
     ]
 
-    assert prices == excepted_value
+    assert prices == expected_value
 
 
 def test_checkout_line_repr(product, checkout_with_single_item):
@@ -272,5 +291,5 @@ def test_get_total_weight(checkout_with_item):
     variant.save()
     line.quantity = 6
     line.save()
-    lines = fetch_checkout_lines(checkout_with_item)
+    lines, _ = fetch_checkout_lines(checkout_with_item)
     assert checkout_with_item.get_total_weight(lines) == Weight(kg=60)

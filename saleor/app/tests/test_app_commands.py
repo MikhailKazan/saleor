@@ -5,7 +5,7 @@ import requests
 from django.core.management import call_command
 
 from ...core import JobStatus
-from ...core.permissions import get_permissions
+from ...permission.enums import get_permissions
 from ..models import App, AppInstallation
 
 
@@ -55,17 +55,16 @@ def test_creates_app_from_manifest_sends_token(monkeypatch):
 
     call_command("install_app", manifest_url)
 
-    app = App.objects.get()
-    token = app.tokens.all()[0].auth_token
     mocked_post.assert_called_once_with(
         "http://localhost:3000/register",
         headers={
             "Content-Type": "application/json",
             # X- headers will be deprecated in Saleor 4.0, proper headers are without X-
-            "x-saleor-domain": "mirumee.com",
-            "saleor-domain": "mirumee.com",
+            "X-Saleor-Domain": "mirumee.com",
+            "Saleor-Domain": "mirumee.com",
+            "Saleor-Api-Url": "http://mirumee.com/graphql/",
         },
-        json={"auth_token": token},
+        json={"auth_token": ANY},
         timeout=ANY,
     )
 
@@ -120,15 +119,14 @@ def test_sends_data_to_target_url(monkeypatch):
 
     call_command("create_app", name, permission=permissions, target_url=target_url)
 
-    app = App.objects.filter(name=name)[0]
-    token = app.tokens.all()[0].auth_token
     mocked_post.assert_called_once_with(
         target_url,
         headers={
             # X- headers will be deprecated in Saleor 4.0, proper headers are without X-
-            "x-saleor-domain": "mirumee.com",
-            "saleor-domain": "mirumee.com",
+            "X-Saleor-Domain": "mirumee.com",
+            "Saleor-Domain": "mirumee.com",
+            "Saleor-Api-Url": "http://mirumee.com/graphql/",
         },
-        json={"auth_token": token},
+        json={"auth_token": ANY},
         timeout=ANY,
     )

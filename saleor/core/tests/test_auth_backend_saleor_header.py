@@ -1,20 +1,19 @@
 import jwt
 import pytest
-from django.contrib.auth.models import Permission
 from freezegun import freeze_time
 from jwt import ExpiredSignatureError, InvalidSignatureError, InvalidTokenError
 
+from ...permission.enums import get_permissions_from_names
+from ...permission.models import Permission
 from ..auth_backend import JSONWebTokenBackend
 from ..jwt import (
     JWT_ACCESS_TYPE,
-    JWT_ALGORITHM,
     create_access_token,
     create_access_token_for_app,
     create_refresh_token,
     jwt_encode,
     jwt_user_payload,
 )
-from ..permissions import get_permissions_from_names
 
 
 @pytest.mark.parametrize("token_type", ["Basic", "Bearer"])
@@ -93,7 +92,7 @@ def test_incorrect_token(rf, staff_user, settings):
     token = jwt.encode(
         payload,
         "Wrong secret",
-        JWT_ALGORITHM,
+        "HS256",
     )
     request = rf.request(HTTP_AUTHORIZATION_BEARER=f"{token}")
     backend = JSONWebTokenBackend()

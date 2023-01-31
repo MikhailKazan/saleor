@@ -1,11 +1,20 @@
 import django_filters
-from graphene_django.filter import GlobalIDMultipleChoiceFilter
+import graphene
+from django.db.models import Exists, OuterRef, Q
 
+from ...account.models import Address
+from ...product.models import Product, ProductVariant
 from ...warehouse import WarehouseClickAndCollectOption
 from ...warehouse.models import Stock, Warehouse
-from ..core.filters import EnumFilter
+from ..channel.types import Channel
+from ..core.filters import (
+    EnumFilter,
+    GlobalIDMultipleChoiceFilter,
+    ListObjectTypeFilter,
+    filter_slug_list,
+)
 from ..core.types import FilterInputObjectType
-from ..utils.filters import filter_by_query_param
+from ..utils import resolve_global_ids_to_primary_keys
 from ..warehouse.enums import WarehouseClickAndCollectOptionEnum
 
 
@@ -14,20 +23,20 @@ def prefech_qs_for_filter(qs):
 
 
 def filter_search_warehouse(qs, _, value):
-    search_fields = [
-        "name",
-        "address__company_name",
-        "email",
-        "address__street_address_1",
-        "address__street_address_2",
-        "address__city",
-        "address__postal_code",
-        "address__phone",
-    ]
-
     if value:
-        qs = prefech_qs_for_filter(qs)
-        qs = filter_by_query_param(qs, value, search_fields)
+        addresses = Address.objects.filter(
+            Q(company_name__ilike=value)
+            | Q(street_address_1__ilike=value)
+            | Q(street_address_2__ilike=value)
+            | Q(city__ilike=value)
+            | Q(postal_code__ilike=value)
+            | Q(phone__ilike=value)
+        ).values("pk")
+        qs = qs.filter(
+            Q(name__ilike=value)
+            | Q(email__ilike=value)
+            | Q(Exists(addresses.filter(pk=OuterRef("address_id"))))
+        )
     return qs
 
 
@@ -45,18 +54,32 @@ def filter_click_and_collect_option(qs, _, value):
     return qs
 
 
-def filter_search_stock(qs, _, value):
-    search_fields = [
-        "product_variant__product__name",
-        "product_variant__name",
-        "warehouse__name",
-        "warehouse__address__company_name",
-    ]
-    if value:
-        qs = qs.select_related("product_variant", "warehouse").prefetch_related(
-            "product_variant__product"
+def filter_channels(qs, _, values):
+    if values:
+        _, channels_ids = resolve_global_ids_to_primary_keys(values, Channel)
+        WarehouseChannel = Warehouse.channels.through
+        warehouse_channels = WarehouseChannel.objects.filter(
+            channel_id__in=channels_ids
         )
-        qs = filter_by_query_param(qs, value, search_fields)
+        qs = qs.filter(Exists(warehouse_channels.filter(warehouse_id=OuterRef("id"))))
+    return qs
+
+
+def filter_search_stock(qs, _, value):
+    if value:
+        products = Product.objects.filter(name__ilike=value).values("pk")
+        variants = ProductVariant.objects.filter(
+            Q(name__ilike=value) | Q(Exists(products.filter(pk=OuterRef("product_id"))))
+        ).values("pk")
+        addresses = Address.objects.filter(company_name__ilike=value)
+        warehouses = Warehouse.objects.filter(
+            Q(name__ilike=value)
+            | Q(Exists(addresses.filter(id=OuterRef("address_id"))))
+        ).values("pk")
+        return qs.filter(
+            Q(Exists(variants.filter(pk=OuterRef("product_variant_id"))))
+            | Q(Exists(warehouses.filter(stock=OuterRef("pk"))))
+        )
     return qs
 
 
@@ -68,6 +91,8 @@ class WarehouseFilter(django_filters.FilterSet):
         input_class=WarehouseClickAndCollectOptionEnum,
         method=filter_click_and_collect_option,
     )
+    channels = GlobalIDMultipleChoiceFilter(method=filter_channels)
+    slugs = ListObjectTypeFilter(input_class=graphene.String, method=filter_slug_list)
 
     class Meta:
         model = Warehouse
