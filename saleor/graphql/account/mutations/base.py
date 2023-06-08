@@ -313,7 +313,7 @@ class ConfirmEmail(BaseMutation):
 
         if not user.get_value_from_private_metadata("email_confirmed"):
             user.store_value_in_private_metadata({"email_confirmed": True})
-        user.save(update_fields=["updated_at"])
+        user.save(update_fields=["private_metadata", "updated_at"])
 
         return ConfirmEmail(user=user)
 
