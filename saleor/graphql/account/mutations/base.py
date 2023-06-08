@@ -268,6 +268,56 @@ class ConfirmAccount(BaseMutation):
         return ConfirmAccount(user=user)
 
 
+class ConfirmEmail(BaseMutation):
+    user = graphene.Field(User, description="An activated user account.")
+
+    class Arguments:
+        token = graphene.String(
+            description="A one-time token required to confirm the account.",
+            required=True,
+        )
+        email = graphene.String(
+            description="E-mail of the user performing account confirmation.",
+            required=True,
+        )
+
+    class Meta:
+        description = (
+            "Confirm user account with token sent by email during registration."
+        )
+        error_type_class = AccountError
+        error_type_field = "account_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
+        try:
+            user = models.User.objects.get(email=data["email"])
+        except ObjectDoesNotExist:
+            raise ValidationError(
+                {
+                    "email": ValidationError(
+                        "User with this email doesn't exist",
+                        code=AccountErrorCode.NOT_FOUND.value,
+                    )
+                }
+            )
+
+        if not default_token_generator.check_token(user, data["token"]):
+            raise ValidationError(
+                {
+                    "token": ValidationError(
+                        INVALID_TOKEN, code=AccountErrorCode.INVALID.value
+                    )
+                }
+            )
+
+        if not user.get_value_from_private_metadata("email_confirmed"):
+            user.store_value_in_private_metadata({"email_confirmed": True})
+        user.save(update_fields=["updated_at"])
+
+        return ConfirmEmail(user=user)
+
+
 class PasswordChange(BaseMutation):
     user = graphene.Field(User, description="A user instance with a new password.")
 
