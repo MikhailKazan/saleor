@@ -34,6 +34,8 @@ RUN apt-get update \
   libpq5 \
   shared-mime-info \
   mime-support \
+  gettext \
+  libpq-dev \
   openssh-server \
   whois \
 #  && apt purge -y whois \
@@ -41,6 +43,7 @@ RUN apt-get update \
   && apt -y autoclean \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
+
 
 RUN mkdir -p /app/media /app/static \
   && chown -R saleor:saleor /app/

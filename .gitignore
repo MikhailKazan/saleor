@@ -6,6 +6,7 @@
 !.nvmrc
 !.pylintrc
 !.vscode
+!requirements_dev.txt
 *.log
 *.pot
 *.pyc

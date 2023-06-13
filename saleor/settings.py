@@ -62,7 +62,7 @@ MANAGERS = ADMINS
 
 APPEND_SLASH = False
 
-_DEFAULT_CLIENT_HOSTS = "localhost,127.0.0.1"
+_DEFAULT_CLIENT_HOSTS = "localhost,127.0.0.1,sdfaewfe7aodgfcaeut7ouasgb.eu.ngrok.io"
 
 ALLOWED_CLIENT_HOSTS = os.environ.get("ALLOWED_CLIENT_HOSTS")
 if not ALLOWED_CLIENT_HOSTS:
@@ -90,7 +90,7 @@ DATABASE_CONNECTION_REPLICA_NAME = "default"
 
 DATABASES = {
     DATABASE_CONNECTION_DEFAULT_NAME: dj_database_url.config(
-        default="postgres://saleor:saleor@localhost:5432/saleor",
+        default="postgres://CMsUKuFjdoZEiLIEBKPdTwWd:e47Y2RbziAVpjV0BC808BRlshmkxmtFfvpKrnEi2ygKf3JQgXMCL5YdGxQ20w09o@localhost:5432/shop",
         conn_max_age=DB_CONN_MAX_AGE,
     ),
     # TODO: We need to add read only user to saleor platfrom, and we need to update
