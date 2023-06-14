@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<div>
+  <div style="margin:0px auto;max-width:600px;">
+
+    <h1
+      style="font-family:Tahoma, Helvetica, Arial, sans-serif;font-size:16px;line-height:2;text-align:center;color:#000000;">
+      {{ site_name }}
+    </h1>
+
+    <div
+      style="font-family:Tahoma, Helvetica, Arial, sans-serif;font-size:14px;line-height:2;text-align:center;color:#000000;">
+      Für die Registrierung bei {{ site_name }} müssen Sie zuerst Ihre E-Mail-Adresse bestätigen.
+    </div>
+    <div
+      style="font-family:Tahoma, Helvetica, Arial, sans-serif;font-size:14px;line-height:2;text-align:center;color:#000000;">
+      Bitte drucken Sie dafür den Link unten.
+    </div>
+
+    <div
+      style="font-family:Tahoma, Helvetica, Arial, sans-serif;font-size:13px;line-height:2;text-align:center;color:#000000;">
+      <a href="{{ confirm_url }}">
+        E-Mail-Adresse bestätigen
+      </a>
+    </div>
+
+    <div
+      style="font-family:Tahoma, Helvetica, Arial, sans-serif;font-size:13px;line-height:2;text-align:center;color:#000000;">
+      Mit freunldichen Grüßen, {{ site_name }}
+    </div>
+  </div>
+</div>
+</body>
+</html>
