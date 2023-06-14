@@ -1,5 +1,6 @@
 class UserNotifyEvent:
     ACCOUNT_CONFIRMATION = "account_confirmation"
+    ACCOUNT_COMPLETION = "account_completion"
     ACCOUNT_PASSWORD_RESET = "account_password_reset"
     ACCOUNT_CHANGE_EMAIL_REQUEST = "account_change_email_request"
     ACCOUNT_CHANGE_EMAIL_CONFIRM = "account_change_email_confirm"
