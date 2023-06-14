@@ -1,6 +1,7 @@
 from typing import cast
 
 import graphene
+from django.conf import settings
 from django.contrib.auth import password_validation
 from django.contrib.auth.tokens import default_token_generator
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
@@ -11,6 +12,7 @@ from ....account.error_codes import AccountErrorCode
 from ....account.notifications import (
     send_password_reset_notification,
     send_set_password_notification,
+    send_account_completion
 )
 from ....account.search import prepare_user_search_document_value
 from ....account.utils import retrieve_user_by_email
@@ -310,10 +312,18 @@ class ConfirmEmail(BaseMutation):
                     )
                 }
             )
-
-        if not user.get_value_from_private_metadata("email_confirmed"):
-            user.store_value_in_private_metadata({"email_confirmed": True})
-        user.save(update_fields=["private_metadata", "updated_at"])
+        with traced_atomic_transaction():
+            if settings.ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL:
+                user.store_value_in_private_metadata({"email_confirmed": True})
+                user.save(update_fields=["private_metadata", "updated_at"])
+                notifications.send_account_confirmation(
+                    user,
+                    cleaned_input["redirect_url"],
+                    manager,
+                    channel_slug=cleaned_input["channel"],
+                )
+            else:
+                user.save()
 
         return ConfirmEmail(user=user)
 
