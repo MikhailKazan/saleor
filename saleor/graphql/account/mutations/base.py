@@ -304,6 +304,17 @@ class ConfirmEmail(BaseMutation):
                 }
             )
 
+        try:
+            validate_storefront_url(data["redirect_url"])
+        except ValidationError as error:
+            raise ValidationError(
+                {
+                    "redirect_url": ValidationError(
+                        error.message, code=AccountErrorCode.INVALID.value
+                    )
+                }
+            )
+
         if not default_token_generator.check_token(user, data["token"]):
             raise ValidationError(
                 {
@@ -312,18 +323,23 @@ class ConfirmEmail(BaseMutation):
                     )
                 }
             )
+
+        manager = get_plugin_manager_promise(info.context).get()
+
+        data["channel"] = clean_channel(
+            data.get("channel"), error_class=AccountErrorCode
+        ).slug
+
         with traced_atomic_transaction():
+            user.store_value_in_private_metadata({"email_confirmed": True})
+            user.save(update_fields=["private_metadata", "updated_at"])
             if settings.ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL:
-                user.store_value_in_private_metadata({"email_confirmed": True})
-                user.save(update_fields=["private_metadata", "updated_at"])
-                notifications.send_account_confirmation(
+                send_account_completion(
                     user,
-                    cleaned_input["redirect_url"],
+                    data["redirect_url"],
                     manager,
-                    channel_slug=cleaned_input["channel"],
+                    channel_slug=data["channel"],
                 )
-            else:
-                user.save()
 
         return ConfirmEmail(user=user)
 
