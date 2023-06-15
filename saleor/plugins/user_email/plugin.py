@@ -84,6 +84,14 @@ class UserEmailPlugin(BasePlugin):
             "value": DEFAULT_EMAIL_VALUE,
         },
         {
+            "name": constants.ACCOUNT_COMPLETION_SUBJECT_FIELD,
+            "value": constants.ACCOUNT_COMPLETION_DEFAULT_SUBJECT,
+        },
+        {
+            "name": constants.ACCOUNT_COMPLETION_TEMPLATE_FIELD,
+            "value": DEFAULT_EMAIL_VALUE,
+        },
+        {
             "name": constants.ACCOUNT_SET_CUSTOMER_PASSWORD_SUBJECT_FIELD,
             "value": constants.ACCOUNT_SET_CUSTOMER_PASSWORD_DEFAULT_SUBJECT,
         },
