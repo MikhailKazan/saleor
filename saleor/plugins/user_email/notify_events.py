@@ -72,6 +72,26 @@ def send_account_confirmation(payload: dict, config: dict, plugin: "UserEmailPlu
     )
 
 
+def send_account_completion(payload: dict, config: dict, plugin: "UserEmailPlugin"):
+    recipient_email = payload["recipient_email"]
+    template = get_email_template_or_default(
+        plugin,
+        constants.ACCOUNT_COMPLETION_TEMPLATE_FIELD,
+        constants.ACCOUNT_COMPLETION_DEFAULT_TEMPLATE,
+        constants.DEFAULT_EMAIL_TEMPLATES_PATH,
+    )
+    if not template:
+        # Empty template means that we don't want to trigger a given event.
+        return
+    subject = get_email_subject(
+        plugin.configuration,
+        constants.ACCOUNT_COMPLETION_SUBJECT_FIELD,
+        constants.ACCOUNT_COMPLETION_DEFAULT_SUBJECT,
+    )
+    send_account_confirmation_email_task.delay(
+        recipient_email, payload, config, subject, template
+    )
+
 def send_account_change_email_request(
     payload: dict, config: dict, plugin: "UserEmailPlugin"
 ):

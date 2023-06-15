@@ -10,6 +10,7 @@ DEFAULT_EMAIL_TEMPLATES_PATH = os.path.join(
 )
 
 ACCOUNT_CONFIRMATION_TEMPLATE_FIELD = "account_confirmation"
+ACCOUNT_COMPLETION_TEMPLATE_FIELD = "account_completion"
 ACCOUNT_SET_CUSTOMER_PASSWORD_TEMPLATE_FIELD = "account_set_customer_password"
 ACCOUNT_DELETE_TEMPLATE_FIELD = "account_delete"
 ACCOUNT_CHANGE_EMAIL_CONFIRM_TEMPLATE_FIELD = "account_change_email_confirm"
@@ -44,6 +45,7 @@ TEMPLATE_FIELDS = [
 ]
 
 ACCOUNT_CONFIRMATION_DEFAULT_TEMPLATE = "confirm.html"
+ACCOUNT_COMPLETION_DEFAULT_TEMPLATE = "complete.html"
 ACCOUNT_SET_CUSTOMER_PASSWORD_DEFAULT_TEMPLATE = "set_customer_password.html"
 ACCOUNT_DELETE_DEFAULT_TEMPLATE = "account_delete.html"
 ACCOUNT_CHANGE_EMAIL_CONFIRM_DEFAULT_TEMPLATE = "email_changed_notification.html"
@@ -61,6 +63,7 @@ SEND_GIFT_CARD_DEFAULT_TEMPLATE = "gift_card.html"
 
 
 ACCOUNT_CONFIRMATION_SUBJECT_FIELD = "account_confirmation_subject"
+ACCOUNT_COMPLETION_SUBJECT_FIELD = "account_copletion_subject"
 ACCOUNT_SET_CUSTOMER_PASSWORD_SUBJECT_FIELD = "account_set_customer_password_subject"
 ACCOUNT_DELETE_SUBJECT_FIELD = "account_delete_subject"
 ACCOUNT_CHANGE_EMAIL_CONFIRM_SUBJECT_FIELD = "account_change_email_confirm_subject"
@@ -78,6 +81,7 @@ SEND_GIFT_CARD_SUBJECT_FIELD = "send_gift_card_subject"
 
 
 ACCOUNT_CONFIRMATION_DEFAULT_SUBJECT = "Account confirmation e-mail"
+ACCOUNT_COMPLETION_DEFAULT_SUBJECT = "Account completion e-mail"
 ACCOUNT_SET_CUSTOMER_PASSWORD_DEFAULT_SUBJECT = "Hello from {{ site_name }}!"
 ACCOUNT_DELETE_DEFAULT_SUBJECT = "Delete your account"
 ACCOUNT_CHANGE_EMAIL_CONFIRM_DEFAULT_SUBJECT = "Email change e-mail"

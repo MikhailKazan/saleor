@@ -24,6 +24,7 @@ from .notify_events import (
     send_account_change_email_confirm,
     send_account_change_email_request,
     send_account_confirmation,
+    send_account_completion,
     send_account_delete,
     send_account_password_reset_event,
     send_account_set_customer_password,
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 def get_user_event_map():
     return {
         UserNotifyEvent.ACCOUNT_CONFIRMATION: send_account_confirmation,
+        UserNotifyEvent.ACCOUNT_COMPLETION: send_account_completion,
         UserNotifyEvent.ACCOUNT_SET_CUSTOMER_PASSWORD: (
             send_account_set_customer_password
         ),
