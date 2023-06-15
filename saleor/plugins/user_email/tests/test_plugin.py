@@ -19,6 +19,7 @@ from ..notify_events import (
     send_account_change_email_confirm,
     send_account_change_email_request,
     send_account_confirmation,
+    send_account_completion,
     send_account_delete,
     send_account_password_reset_event,
     send_account_set_customer_password,
@@ -38,6 +39,7 @@ from ..plugin import get_user_event_map
 def test_event_map():
     assert get_user_event_map() == {
         NotifyEventType.ACCOUNT_CONFIRMATION: send_account_confirmation,
+        NotifyEventType.ACCOUNT_COMPLETION: send_account_completion,
         NotifyEventType.ACCOUNT_SET_CUSTOMER_PASSWORD: (
             send_account_set_customer_password
         ),
@@ -61,6 +63,7 @@ def test_event_map():
     "event_type",
     [
         NotifyEventType.ACCOUNT_CONFIRMATION,
+        NotifyEventType.ACCOUNT_COMPLETION,
         NotifyEventType.ACCOUNT_SET_CUSTOMER_PASSWORD,
         NotifyEventType.ACCOUNT_DELETE,
         NotifyEventType.ACCOUNT_CHANGE_EMAIL_CONFIRM,

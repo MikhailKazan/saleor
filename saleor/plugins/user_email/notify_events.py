@@ -92,6 +92,7 @@ def send_account_completion(payload: dict, config: dict, plugin: "UserEmailPlugi
         recipient_email, payload, config, subject, template
     )
 
+
 def send_account_change_email_request(
     payload: dict, config: dict, plugin: "UserEmailPlugin"
 ):

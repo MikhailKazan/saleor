@@ -304,16 +304,16 @@ class ConfirmEmail(BaseMutation):
                 }
             )
 
-        try:
-            validate_storefront_url(data["redirect_url"])
-        except ValidationError as error:
-            raise ValidationError(
-                {
-                    "redirect_url": ValidationError(
-                        error.message, code=AccountErrorCode.INVALID.value
-                    )
-                }
-            )
+        # try:
+        #     validate_storefront_url(data["redirect_url"])
+        # except ValidationError as error:
+        #     raise ValidationError(
+        #         {
+        #             "redirect_url": ValidationError(
+        #                 error.message, code=AccountErrorCode.INVALID.value
+        #             )
+        #         }
+        #     )
 
         if not default_token_generator.check_token(user, data["token"]):
             raise ValidationError(
@@ -336,7 +336,7 @@ class ConfirmEmail(BaseMutation):
             if settings.ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL:
                 send_account_completion(
                     user,
-                    data["redirect_url"],
+                    # data["redirect_url"],
                     manager,
                     channel_slug=data["channel"],
                 )

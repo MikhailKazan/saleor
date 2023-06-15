@@ -207,6 +207,16 @@ class UserEmailPlugin(BasePlugin):
             "help_text": DEFAULT_TEMPLATE_HELP_TEXT,
             "label": "Account confirmation - template",
         },
+        constants.ACCOUNT_COMPLETION_SUBJECT_FIELD: {
+            "type": ConfigurationTypeField.STRING,
+            "help_text": DEFAULT_SUBJECT_HELP_TEXT,
+            "label": "Account completion - subject",
+        },
+        constants.ACCOUNT_COMPLETION_TEMPLATE_FIELD: {
+            "type": ConfigurationTypeField.MULTILINE,
+            "help_text": DEFAULT_TEMPLATE_HELP_TEXT,
+            "label": "Account completion - template",
+        },
         constants.ACCOUNT_SET_CUSTOMER_PASSWORD_SUBJECT_FIELD: {
             "type": ConfigurationTypeField.STRING,
             "help_text": DEFAULT_SUBJECT_HELP_TEXT,

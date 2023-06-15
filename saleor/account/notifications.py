@@ -81,13 +81,14 @@ def send_account_confirmation(user, redirect_url, manager, channel_slug):
     )
 
 
-def send_account_completion(user, redirect_url, manager, channel_slug):
+# def send_account_completion(user, redirect_url, manager, channel_slug):
+def send_account_completion(user, manager, channel_slug):
     """Trigger sending an account confirmation notification for the given user."""
 
     payload = {
         "user": get_default_user_payload(user),
         "recipient_email": user.email,
-        "redirect_url": redirect_url,
+        # "redirect_url": redirect_url,
         "channel_slug": channel_slug,
         **get_site_context(),
     }

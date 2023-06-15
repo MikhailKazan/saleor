@@ -9,6 +9,7 @@ from ..notify_events import (
     send_account_change_email_confirm,
     send_account_change_email_request,
     send_account_confirmation,
+    send_account_completion,
     send_account_delete,
     send_account_password_reset_event,
     send_account_set_customer_password,
@@ -94,7 +95,7 @@ def test_send_account_confirmation(mocked_email_task, customer_user, user_email_
 
 
 @mock.patch(
-    "saleor.plugins.user_email.notify_events.send_account_confirmation_email_task.delay"
+    "saleor.plugins.user_email.notify_events.send_account_completion_email_task.delay"
 )
 def test_send_account_confirmation_with_empty_template(
     mocked_email_task, customer_user, user_email_plugin
@@ -115,6 +116,53 @@ def test_send_account_confirmation_with_empty_template(
         plugin=user_email_plugin(account_confirmation_template=""),
     )
     assert not mocked_email_task.called
+
+
+@mock.patch(
+    "saleor.plugins.user_email.notify_events.send_account_completion_email_task.delay"
+)
+def test_send_account_completion(mocked_email_task, customer_user, user_email_plugin):
+    token = "token123"
+    payload = {
+        "user": get_default_user_payload(customer_user),
+        "recipient_email": "user@example.com",
+        "token": token,
+        "confirm_url": f"http://localhost:8000/redirect{token}",
+        "domain": "localhost:8000",
+        "site_name": "Saleor",
+    }
+    config = {"host": "localhost", "port": "1025"}
+    send_account_completion(
+        payload=payload, config=config, plugin=user_email_plugin()
+    )
+    mocked_email_task.assert_called_with(
+        payload["recipient_email"], payload, config, mock.ANY, mock.ANY
+    )
+
+
+@mock.patch(
+    "saleor.plugins.user_email.notify_events.send_account_completion_email_task.delay"
+)
+def test_send_account_completion_with_empty_template(
+    mocked_email_task, customer_user, user_email_plugin
+):
+    token = "token123"
+    payload = {
+        "user": get_default_user_payload(customer_user),
+        "recipient_email": "user@example.com",
+        "token": token,
+        "confirm_url": f"http://localhost:8000/redirect{token}",
+        "domain": "localhost:8000",
+        "site_name": "Saleor",
+    }
+    config = {"host": "localhost", "port": "1025"}
+    send_account_completion(
+        payload=payload,
+        config=config,
+        plugin=user_email_plugin(account_completion_template=""),
+    )
+    assert not mocked_email_task.called
+
 
 
 @mock.patch(

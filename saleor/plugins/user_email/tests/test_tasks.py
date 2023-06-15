@@ -14,6 +14,7 @@ from ....order.notifications import (
 from ...email_common import EmailConfig
 from ...user_email.tasks import (
     send_account_confirmation_email_task,
+    send_account_completion_email_task,
     send_account_delete_confirmation_email_task,
     send_fulfillment_confirmation_email_task,
     send_fulfillment_update_email_task,
@@ -72,6 +73,64 @@ def test_send_account_confirmation_email_task_custom_template(
     }
 
     send_account_confirmation_email_task(
+        recipient_email,
+        payload,
+        user_email_dict_config,
+        expected_subject,
+        expected_template_str,
+    )
+
+    email_config = EmailConfig(**user_email_dict_config)
+    mocked_send_email.assert_called_with(
+        config=email_config,
+        recipient_list=[recipient_email],
+        context=payload,
+        subject=expected_subject,
+        template_str=expected_template_str,
+    )
+
+
+@mock.patch("saleor.plugins.email_common.send_mail")
+def test_send_account_completion_email_task_default_template(
+    mocked_send_mail, user_email_dict_config, customer_user
+):
+    recipient_email = "admin@example.com"
+    token = "token123"
+    payload = {
+        "user": get_default_user_payload(customer_user),
+        "recipient_email": recipient_email,
+        "token": token,
+        "reset_url": f"http://localhost:8000/redirect{token}",
+        "domain": "localhost:8000",
+        "site_name": "Saleor",
+    }
+
+    send_account_completion_email_task(
+        recipient_email, payload, user_email_dict_config, "subject", "template"
+    )
+
+    # confirm that mail has correct structure and email was sent
+    assert mocked_send_mail.called
+
+
+@mock.patch("saleor.plugins.user_email.tasks.send_email")
+def test_send_account_completion_email_task_custom_template(
+    mocked_send_email, user_email_dict_config, customer_user
+):
+    expected_template_str = "<html><body>Template body</body></html>"
+    expected_subject = "Test Email Subject"
+    recipient_email = "admin@example.com"
+    token = "token123"
+    payload = {
+        "user": get_default_user_payload(customer_user),
+        "recipient_email": "user@example.com",
+        "token": token,
+        "reset_url": f"http://localhost:8000/redirect{token}",
+        "domain": "localhost:8000",
+        "site_name": "Saleor",
+    }
+
+    send_account_completion_email_task(
         recipient_email,
         payload,
         user_email_dict_config,
