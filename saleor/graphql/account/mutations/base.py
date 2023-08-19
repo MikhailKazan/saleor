@@ -333,7 +333,7 @@ class ConfirmEmail(BaseMutation):
         with traced_atomic_transaction():
             user.store_value_in_private_metadata({"email_confirmed": True})
             user.save(update_fields=["private_metadata", "updated_at"])
-            if settings.ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL:
+            if settings.ENABLE_ACCOUNT_COMPLETION_BY_EMAIL:
                 send_account_completion(
                     user,
                     # data["redirect_url"],

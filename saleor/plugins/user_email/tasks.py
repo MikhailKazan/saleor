@@ -28,6 +28,9 @@ def send_account_completion_email_task(
 ):
     email_config = EmailConfig(**config)
 
+    email_config.sender_name = payload['sender_name']
+    email_config.sender_address = payload['sender_address']
+
     send_email(
         config=email_config,
         recipient_list=[recipient_email],

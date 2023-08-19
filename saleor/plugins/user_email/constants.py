@@ -11,6 +11,8 @@ DEFAULT_EMAIL_TEMPLATES_PATH = os.path.join(
 
 ACCOUNT_CONFIRMATION_TEMPLATE_FIELD = "account_confirmation"
 ACCOUNT_COMPLETION_TEMPLATE_FIELD = "account_completion"
+ACCOUNT_COMPLETION_EMAIL_NAME_FIELD = "account_completion_email_name"
+ACCOUNT_COMPLETION_EMAIL_ADDRESS_FIELD = "account_completion_email_address"
 ACCOUNT_SET_CUSTOMER_PASSWORD_TEMPLATE_FIELD = "account_set_customer_password"
 ACCOUNT_DELETE_TEMPLATE_FIELD = "account_delete"
 ACCOUNT_CHANGE_EMAIL_CONFIRM_TEMPLATE_FIELD = "account_change_email_confirm"
@@ -64,7 +66,7 @@ SEND_GIFT_CARD_DEFAULT_TEMPLATE = "gift_card.html"
 
 
 ACCOUNT_CONFIRMATION_SUBJECT_FIELD = "account_confirmation_subject"
-ACCOUNT_COMPLETION_SUBJECT_FIELD = "account_copletion_subject"
+ACCOUNT_COMPLETION_SUBJECT_FIELD = "account_completion_subject"
 ACCOUNT_SET_CUSTOMER_PASSWORD_SUBJECT_FIELD = "account_set_customer_password_subject"
 ACCOUNT_DELETE_SUBJECT_FIELD = "account_delete_subject"
 ACCOUNT_CHANGE_EMAIL_CONFIRM_SUBJECT_FIELD = "account_change_email_confirm_subject"
