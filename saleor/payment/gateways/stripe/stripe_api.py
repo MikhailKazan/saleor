@@ -322,3 +322,10 @@ def get_payment_method_details(
                 type="card",
             )
     return payment_method_info
+
+def payment_initialize(
+    api_key: str,
+    amount: Decimal,
+    currency: str,
+) -> Tuple[Optional[StripeObject], Optional[StripeError]]:
+    pass
