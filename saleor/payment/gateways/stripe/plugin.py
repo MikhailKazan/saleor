@@ -29,6 +29,7 @@ from .stripe_api import (
     delete_webhook,
     get_or_create_customer,
     get_payment_method_details,
+    confirm_payment as call_confirm_payment,
     is_secret_api_key_valid,
     list_customer_payment_methods,
     refund_payment_intent,
@@ -326,6 +327,9 @@ class StripeGatewayPlugin(BasePlugin):
 
             if kind in (TransactionKind.AUTH, TransactionKind.CAPTURE):
                 payment_method_info = get_payment_method_details(payment_intent)
+
+            if kind in (TransactionKind.ACTION_TO_CONFIRM):
+                payment_intent = call_confirm_payment(payment_intent)
 
         else:
             action_required = False
