@@ -133,6 +133,7 @@ def create_payment_intent(
     setup_future_usage: Optional[str] = None,
     off_session: Optional[bool] = None,
     payment_method_types: Optional[List[str]] = None,
+    automatic_payment_methods: Optional[dict] = None,
     customer_email: Optional[str] = None,
 ) -> Tuple[Optional[StripeObject], Optional[StripeError]]:
 
@@ -157,6 +158,9 @@ def create_payment_intent(
 
     if payment_method_types and isinstance(payment_method_types, list):
         additional_params["payment_method_types"] = payment_method_types
+
+    if automatic_payment_methods and isinstance(automatic_payment_methods, dict):
+        additional_params["automatic_payment_methods"] = automatic_payment_methods
 
     if customer_email:
         additional_params["receipt_email"] = customer_email
@@ -323,9 +327,20 @@ def get_payment_method_details(
             )
     return payment_method_info
 
-def payment_initialize(
-    api_key: str,
-    amount: Decimal,
-    currency: str,
+def confirm_payment(
+    api_key: str, payment_intent_id: str
 ) -> Tuple[Optional[StripeObject], Optional[StripeError]]:
-    pass
+    try:
+        with stripe_opentracing_trace("stripe.PaymentIntent.capture"):
+            payment_intent = stripe.PaymentIntent.confirm(
+                payment_intent_id,
+                amount_to_capture=amount_to_capture,
+                api_key=api_key,
+            )
+        return payment_intent, None
+    except StripeError as error:
+        logger.warning(
+            "Unable to confirm a payment intent",
+            extra=_extra_log_data(error),
+        )
+        return None, error

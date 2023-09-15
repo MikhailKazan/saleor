@@ -1,5 +1,6 @@
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple
+from decimal import Decimal
 
 from django.contrib.sites.models import Site
 from django.core.exceptions import ValidationError
@@ -32,7 +33,7 @@ from .stripe_api import (
     list_customer_payment_methods,
     refund_payment_intent,
     retrieve_payment_intent,
-    subscribe_webhook,
+    subscribe_webhook
 )
 from .webhooks import handle_webhook
 
@@ -83,7 +84,7 @@ class StripeGatewayPlugin(BasePlugin):
         "supported_currencies": {
             "type": ConfigurationTypeField.STRING,
             "help_text": "Determines currencies supported by gateway."
-            " Please enter currency codes separated by a comma.",
+                         " Please enter currency codes separated by a comma.",
             "label": "Supported currencies",
         },
         "webhook_endpoint_id": {
@@ -578,3 +579,108 @@ class StripeGatewayPlugin(BasePlugin):
                 "value": self.config.connection_params["public_api_key"],
             },
         ]
+
+    def initialize_payment(
+        self, payment_data: "PaymentData", previous_value
+    ) -> {str, str, "GatewayResponse"}:
+        if not self.active:
+            return previous_value
+
+        api_key = self.config.connection_params["secret_api_key"]
+
+        auto_capture = self.config.auto_capture
+        if self.order_auto_confirmation is False:
+            auto_capture = False
+
+        data = payment_data
+
+        amount = Decimal(payment_data.get("amount").replace(',', '.'))
+
+        payment_method_id = data.get("payment_method_id") if data else None
+
+        setup_future_usage = None
+        # DEPRECATED: reuse_source will be removed in Saleor 4.0
+        # if payment_information.reuse_source:
+        #     setup_future_usage = data.get("setup_future_usage") if data else None
+
+        off_session = data.get("off_session") if data else None
+
+        payment_method_types = data.get("payment_method_types") if data else None
+
+        automatic_payment_methods = data.get("automatic_payment_methods") if data else None
+
+        if not setup_future_usage:
+            setup_future_usage = self._get_setup_future_usage_from_store_payment_method(
+                data.get("store_payment_method")
+            )
+
+        customer = None
+        # confirm that we creates customer on stripe side only for log-in customers
+        # Stripe doesn't allow to search users by email, so each create customer
+        # call creates new customer on Stripe side.
+        # if payment_information.graphql_customer_id:
+        #     customer = get_or_create_customer(
+        #         api_key=api_key,
+        #         customer_email=payment_information.customer_email,
+        #         customer_id=payment_information.customer_id,
+        #     )
+        intent, error = create_payment_intent(
+            api_key=api_key,
+            amount=amount,
+            currency=payment_data.get("currency"),
+            auto_capture=auto_capture,
+            customer=customer,
+            payment_method_id=payment_method_id,
+            # metadata={
+            #     **data.get("payment_metadata"),
+            #     "channel": self.channel.slug,  # type: ignore
+            #     "payment_id": payment_data.graphql_payment_id,
+            # },
+            automatic_payment_methods=automatic_payment_methods,
+            setup_future_usage=setup_future_usage,
+            off_session=off_session,
+            payment_method_types=payment_method_types,
+            # customer_email=payment_data.customer_email,
+        )
+
+        raw_response = None
+        if error:
+            raw_response = getattr(error, "json_body", None)
+            if payment_method_id and not intent:
+                # we can receive an error which is caused by a required authentication
+                # but stripe already created payment_intent.
+                if error.code == "authentication_required":
+                    stripe_error = error.error
+                    intent = getattr(stripe_error, "payment_intent", None)
+                error = None if intent else error
+
+        client_secret = None
+        intent_id = None
+        kind = TransactionKind.ACTION_TO_CONFIRM
+        action_required = True
+        payment_method_info = None
+        if intent:
+            kind, action_required = self._get_transaction_details_for_stripe_status(
+                intent.status
+            )
+            if kind in (TransactionKind.AUTH, TransactionKind.CAPTURE):
+                payment_method_info = get_payment_method_details(intent)
+            client_secret = intent.client_secret
+            last_response = intent.last_response
+            raw_response = last_response.data if last_response else None
+            intent_id = intent.id
+
+        return {"gateway" : "", "name": "", "data": GatewayResponse(
+            is_success=True if not error else False,
+            action_required=action_required,
+            kind=kind,
+            amount=amount,
+            currency=payment_data.get("currency"),
+            transaction_id=intent.id if intent else "",
+            error=error.user_message if error else None,
+            # raw_response=raw_response,
+            action_required_data={"client_secret": client_secret, "id": intent_id},
+            # customer_id=customer.id if customer else None,
+            # psp_reference=intent.id if intent else None,
+            # payment_method_info=payment_method_info,
+        )}

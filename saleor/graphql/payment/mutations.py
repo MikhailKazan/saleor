@@ -523,7 +523,7 @@ class PaymentInitialize(BaseMutation):
                     )
                 }
             )
-        return PaymentInitialize(initialized_payment=response)
+        return PaymentInitialize(initialized_payment={"data":response.get("data").action_required_data})
 
 
 class MoneyInput(graphene.InputObjectType):
