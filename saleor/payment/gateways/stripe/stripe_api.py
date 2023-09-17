@@ -328,14 +328,14 @@ def get_payment_method_details(
     return payment_method_info
 
 def confirm_payment(
-    api_key: str, payment_intent_id: str
+    api_key: str, payment_intent_id: str, payment_method: str
 ) -> Tuple[Optional[StripeObject], Optional[StripeError]]:
     try:
-        with stripe_opentracing_trace("stripe.PaymentIntent.capture"):
+        with stripe_opentracing_trace("stripe.PaymentIntent.confirm"):
             payment_intent = stripe.PaymentIntent.confirm(
                 payment_intent_id,
-                amount_to_capture=amount_to_capture,
                 api_key=api_key,
+                payment_method=payment_method
             )
         return payment_intent, None
     except StripeError as error:

@@ -329,7 +329,7 @@ class StripeGatewayPlugin(BasePlugin):
                 payment_method_info = get_payment_method_details(payment_intent)
 
             if kind in (TransactionKind.ACTION_TO_CONFIRM):
-                payment_intent = call_confirm_payment(payment_intent)
+                payment_intent = call_confirm_payment(api_key, payment_intent_id)
 
         else:
             action_required = False
