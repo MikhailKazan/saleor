@@ -282,6 +282,11 @@ class StripeGatewayPlugin(BasePlugin):
         payment_intent_id = payment_information.token
         api_key = self.config.connection_params["secret_api_key"]
 
+        # get the payment method from the data received from client
+        payment_method = None
+        if payment_information.data:
+            payment_method = payment_information.data["id"]
+
         # before we will call stripe API, let's check if the transaction object hasn't
         # been created by webhook handler
         payment_transaction = Transaction.objects.filter(
@@ -329,7 +334,10 @@ class StripeGatewayPlugin(BasePlugin):
                 payment_method_info = get_payment_method_details(payment_intent)
 
             if kind in (TransactionKind.ACTION_TO_CONFIRM):
-                payment_intent = call_confirm_payment(api_key, payment_intent_id)
+                payment_intent, error = call_confirm_payment(api_key, payment_intent_id,
+                                                      payment_method)
+                if not error:
+                    action_required = False
 
         else:
             action_required = False
@@ -611,7 +619,8 @@ class StripeGatewayPlugin(BasePlugin):
 
         payment_method_types = data.get("payment_method_types") if data else None
 
-        automatic_payment_methods = data.get("automatic_payment_methods") if data else None
+        automatic_payment_methods = data.get(
+            "automatic_payment_methods") if data else None
 
         if not setup_future_usage:
             setup_future_usage = self._get_setup_future_usage_from_store_payment_method(
@@ -674,7 +683,7 @@ class StripeGatewayPlugin(BasePlugin):
             raw_response = last_response.data if last_response else None
             intent_id = intent.id
 
-        return {"gateway" : "", "name": "", "data": GatewayResponse(
+        return {"gateway": "", "name": "", "data": GatewayResponse(
             is_success=True if not error else False,
             action_required=action_required,
             kind=kind,
