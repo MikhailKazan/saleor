@@ -198,6 +198,7 @@ class StripeGatewayPlugin(BasePlugin):
         off_session = data.get("off_session") if data else None
 
         payment_method_types = data.get("payment_method_types") if data else None
+        automatic_payment_methods = data.get("automatic_payment_methods") if data else None
 
         if not setup_future_usage:
             setup_future_usage = self._get_setup_future_usage_from_store_payment_method(
@@ -230,6 +231,7 @@ class StripeGatewayPlugin(BasePlugin):
             off_session=off_session,
             payment_method_types=payment_method_types,
             customer_email=payment_information.customer_email,
+            automatic_payment_methods=automatic_payment_methods
         )
 
         raw_response = None
