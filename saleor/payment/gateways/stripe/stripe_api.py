@@ -134,6 +134,8 @@ def create_payment_intent(
     off_session: Optional[bool] = None,
     payment_method_types: Optional[List[str]] = None,
     automatic_payment_methods: Optional[dict] = None,
+    return_url:Optional[str] = None,
+    confirm:Optional[str] = None,
     customer_email: Optional[str] = None,
 ) -> Tuple[Optional[StripeObject], Optional[StripeError]]:
 
@@ -164,6 +166,12 @@ def create_payment_intent(
 
     if customer_email:
         additional_params["receipt_email"] = customer_email
+
+    if return_url:
+        additional_params["return_url"] = return_url
+
+    if confirm:
+        additional_params["confirm"] = confirm
 
     try:
         with stripe_opentracing_trace("stripe.PaymentIntent.create"):

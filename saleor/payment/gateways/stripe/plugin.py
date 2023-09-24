@@ -189,6 +189,8 @@ class StripeGatewayPlugin(BasePlugin):
         data = payment_information.data
 
         payment_method_id = data.get("payment_method_id") if data else None
+        return_url = data.get("return_url") if data else None
+        confirm = data.get("confirm") if data else None
 
         setup_future_usage = None
         # DEPRECATED: reuse_source will be removed in Saleor 4.0
@@ -215,6 +217,7 @@ class StripeGatewayPlugin(BasePlugin):
                 customer_email=payment_information.customer_email,
                 customer_id=payment_information.customer_id,
             )
+
         intent, error = create_payment_intent(
             api_key=api_key,
             amount=payment_information.amount,
@@ -231,7 +234,9 @@ class StripeGatewayPlugin(BasePlugin):
             off_session=off_session,
             payment_method_types=payment_method_types,
             customer_email=payment_information.customer_email,
-            automatic_payment_methods=automatic_payment_methods
+            automatic_payment_methods=automatic_payment_methods,
+            return_url=return_url,
+            confirm=confirm
         )
 
         raw_response = None
