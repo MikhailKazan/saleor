@@ -261,6 +261,26 @@ def capture_payment_intent(
         return None, error
 
 
+def modify_payment_intent(
+    api_key: str,
+    payment_intent_id: str,
+    payment_method:Optional[str]
+) -> Tuple[Optional[StripeObject], Optional[StripeError]]:
+    try:
+        with stripe_opentracing_trace("stripe.PaymentIntent.retrieve"):
+            payment_intent = stripe.PaymentIntent.modify(
+                payment_intent_id,
+                api_key=api_key,
+                payment_method=payment_method,
+            )
+        return payment_intent, None
+    except StripeError as error:
+        logger.warning(
+            "Unable to modify a payment intent",
+            extra=_extra_log_data(error),
+        )
+        return None, error
+
 def refund_payment_intent(
     api_key: str, payment_intent_id: str, amount_to_refund: int
 ) -> Tuple[Optional[StripeObject], Optional[StripeError]]:
@@ -336,14 +356,15 @@ def get_payment_method_details(
     return payment_method_info
 
 def confirm_payment(
-    api_key: str, payment_intent_id: str, payment_method: str
+    api_key: str, payment_intent_id: str, payment_method: str, return_url: Optional[str]
 ) -> Tuple[Optional[StripeObject], Optional[StripeError]]:
     try:
         with stripe_opentracing_trace("stripe.PaymentIntent.confirm"):
             payment_intent = stripe.PaymentIntent.confirm(
                 payment_intent_id,
                 api_key=api_key,
-                payment_method=payment_method
+                payment_method=payment_method,
+                return_url=return_url
             )
         return payment_intent, None
     except StripeError as error:

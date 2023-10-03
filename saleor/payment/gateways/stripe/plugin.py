@@ -34,6 +34,7 @@ from .stripe_api import (
     list_customer_payment_methods,
     refund_payment_intent,
     retrieve_payment_intent,
+    modify_payment_intent,
     subscribe_webhook
 )
 from .webhooks import handle_webhook
@@ -327,7 +328,13 @@ class StripeGatewayPlugin(BasePlugin):
             payment_intent, error = retrieve_payment_intent(api_key, payment_intent_id)
 
         kind = TransactionKind.AUTH
+        return_url = None
+        action_required_data = None
         if payment_intent:
+            if "return_url" in payment_information.data:
+                return_url = payment_information.data["return_url"]
+                payment_intent, error = modify_payment_intent(api_key, payment_intent_id, payment_method)
+
             amount = price_from_minor_unit(
                 payment_intent.amount, payment_intent.currency
             )
@@ -342,9 +349,13 @@ class StripeGatewayPlugin(BasePlugin):
 
             if kind in (TransactionKind.ACTION_TO_CONFIRM):
                 payment_intent, error = call_confirm_payment(api_key, payment_intent_id,
-                                                      payment_method)
+                                                      payment_method, return_url)
                 if not error:
-                    action_required = False
+                    if payment_intent.next_action:
+                        action_required = True
+                        action_required_data = payment_intent.next_action
+                    else:
+                        action_required = False
 
         else:
             action_required = False
@@ -358,6 +369,7 @@ class StripeGatewayPlugin(BasePlugin):
         return GatewayResponse(
             is_success=True if payment_intent else False,
             action_required=action_required,
+            action_required_data=action_required_data,
             kind=kind,
             amount=amount,
             currency=currency,
