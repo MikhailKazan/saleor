@@ -961,10 +961,13 @@
                                                 <div
                                                         style="color:#787878;font-family:'Josefin Sans', Tahoma, Verdana, Segoe, sans-serif;font-size:18px;line-height:150%;text-align:center;mso-line-height-alt:27px;">
                                                     <p
-                                                            style="margin: 0; word-break: break-word;"><span>Sie erreichen uns per email<strong><a
+                                                            style="margin: 0; word-break: break-word;"><span>Sie erreichen uns per email<strong><br>
+                                                        <a
                                                             style="text-decoration: none; color: #000;" href="#"
                                                             target="_blank"
-                                                            rel="noopener">{{ support_email }}</a></strong></span><br><span>oder per Telefon <span
+                                                            rel="noopener">&nbsp;{{ support_email }}
+                                                        </a></strong></span><br>
+                                                        <span>oder per Telefon<br><span
                                                             style="color:rgb(0,0,0);">(<strong>{{ support_telefon_country_code }}</strong>)</span> <span
                                                             style="color:rgb(0,0,0);"><strong>{{ support_telefon_number }}</strong></span> <br><strong>Montag bis Freitag von 9:00 bis 18:00</strong></span>
                                                     </p>
@@ -1121,8 +1124,6 @@
                                                                         target="_blank" rel="noopener">Rückgabe
                                                                 </a>&nbsp
                                                             </strong>
-                                                            <span style="background-color:transparent;">{{ telefon.country }}&nbsp;{{ telefon.number }}
-                                                            </span>
                                                         </span>
                                                     </p>
                                                 </div>

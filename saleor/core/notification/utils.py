@@ -5,7 +5,7 @@ from ..utils import build_absolute_uri
 
 LOGO_URL = "images/saleor-logo-sign.png"
 
-# TODO: SiteContext should be dynamical created
+# TODO: SiteContext should be dynamicaly created
 SUPPORT_EMAIL = "email:support@enversio.com"
 SUPPORT_TELEFON_COUNTRY_CODE = "+49"
 SUPPORT_TELEFON_NUMBER = "12345-67-89"
@@ -18,6 +18,6 @@ def get_site_context():
         "logo_url": build_absolute_uri(staticfiles_storage.url(LOGO_URL)),
         "support_email": SUPPORT_EMAIL,
         "support_telefon_country_code": SUPPORT_TELEFON_COUNTRY_CODE,
-        "support_telefon_number": SUPPORT_TELEFON_NUMBER,
+        "support_telefon_number": ''.join(["tel:",SUPPORT_TELEFON_NUMBER]),
     }
     return site_context
