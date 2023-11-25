@@ -62,7 +62,7 @@ MANAGERS = ADMINS
 
 APPEND_SLASH = False
 
-_DEFAULT_CLIENT_HOSTS = "localhost,127.0.0.1,sdfaewfe7aodgfcaeut7ouasgb.eu.ngrok.io"
+_DEFAULT_CLIENT_HOSTS = "localhost,127.0.0.1,sdfaewfe7aodgfcaeut7ouasgb.eu.ngrok.io,c3e6305caff5.ngrok.app"
 
 ALLOWED_CLIENT_HOSTS = os.environ.get("ALLOWED_CLIENT_HOSTS")
 if not ALLOWED_CLIENT_HOSTS:
