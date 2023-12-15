@@ -8,11 +8,11 @@ RUN apt-get -y update \
   && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-COPY requirements_dev.txt /app/
+COPY requirements.txt /app/
 WORKDIR /app
 ## sphinxcontrib-applehelp installed due to https://github.com/saleor/saleor/issues/11664
 RUN pip install sphinxcontrib-applehelp==1.0.2
-RUN pip install -r requirements_dev.txt
+RUN pip install -r requirements.txt
 
 ### Debug image
 FROM python:3.9-slim as debug

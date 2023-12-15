@@ -1,5 +1,5 @@
 {
-  "name": "saleor",
+  "name": "enversio",
   "version": "3.12.0-a",
   "engines": {
     "node": ">=16 <17",
@@ -7,14 +7,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/saleor/saleor.git"
+    "url": "git://github.com/MikhailKazan/saleor.git"
   },
-  "author": "Saleor Commerce",
+  "author": "Enversio",
   "license": "BSD-3-Clause",
   "bugs": {
-    "url": "https://github.com/saleor/saleor/issues"
+    "url": "https://github.com/MikhailKazan/saleor/issues"
   },
-  "homepage": "http://saleor.io/",
+  "homepage": "http://enversio.com/",
   "devDependencies": {
     "@release-it/bumper": "^4.0.0",
     "release-it": "^15.4.2"
