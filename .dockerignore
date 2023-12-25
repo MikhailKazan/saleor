@@ -5,3 +5,7 @@ media
 node_modules
 static
 localdocker
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+.git
+.gitignore

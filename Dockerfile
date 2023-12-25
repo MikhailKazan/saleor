@@ -8,11 +8,16 @@ RUN apt-get -y update \
   && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-COPY requirements.txt /app/
+# COPY requirements.txt /app/
 WORKDIR /app
 ## sphinxcontrib-applehelp installed due to https://github.com/saleor/saleor/issues/11664
-RUN pip install sphinxcontrib-applehelp==1.0.2
-RUN pip install -r requirements.txt
+#RUN pip install sphinxcontrib-applehelp==1.0.2
+#RUN pip install -r requirements.txt
+
+RUN --mount=type=cache,mode=0755,target=/root/.cache/pip pip install poetry==1.7.0
+RUN poetry config virtualenvs.create false
+COPY poetry.lock pyproject.toml /app/
+RUN --mount=type=cache,mode=0755,target=/root/.cache/pypoetry poetry install --no-root
 
 ### Debug image
 #FROM python:3.9-slim as debug
