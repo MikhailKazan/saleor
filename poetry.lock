@@ -1890,6 +1890,21 @@ dev = ["black", "ruff"]
 test = ["pytest", "pytest-cov"]
 
 [[package]]
+name = "google-measurement-protocol"
+version = "1.1.0"
+description = "A Python implementation of Google Analytics Measurement Protocol"
+optional = false
+python-versions = "*"
+files = [
+    {file = "google-measurement-protocol-1.1.0.tar.gz", hash = "sha256:aba4a80d956a4b47974d26adc578ab48c363f21f61e8097250c6ef560f3b3416"},
+    {file = "google_measurement_protocol-1.1.0-py2.py3-none-any.whl", hash = "sha256:387800809d143bf490353e19d78bf856066875fdad80817d9f148219c483f087"},
+]
+
+[package.dependencies]
+prices = ">=1.0.0"
+requests = ">=2.0,<3.0a0"
+
+[[package]]
 name = "google-resumable-media"
 version = "2.7.0"
 description = "Utilities for Google Media Downloads and Resumable Uploads"
@@ -5392,4 +5407,4 @@ test = ["pytest"]
 [metadata]
 lock-version = "2.0"
 python-versions = "~3.9"
-content-hash = "c9674bfb8d5fa6aa2ff92ec3cd33f137a2b8c361637eadd63b354de772514bfc"
+content-hash = "9268c80846c70cbd3e77f01e7c56a9b22d10d755d6e5bf57c13c157d11bdf087"
