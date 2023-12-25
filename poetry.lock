@@ -1451,6 +1451,22 @@ files = [
 Django = ">=3.2,<6.0"
 
 [[package]]
+name = "django-versatileimagefield"
+version = "2.2"
+description = "A drop-in replacement for django's ImageField that provides a flexible, intuitive and easily-extensible interface for creating new images from the one assigned to the field."
+category = "main"
+optional = false
+python-versions = "*"
+files = [
+    {file = "django-versatileimagefield-2.2.tar.gz", hash = "sha256:6569d5c3e13c69ab8912ba5100084aa5abcdcffb8d1f5abc085b226e7bbd65b3"},
+    {file = "django_versatileimagefield-2.2-py2.py3-none-any.whl", hash = "sha256:03766f4d2332f192978879fdb196e18c53e6ccef6c55c5c26b59747b76a97288"},
+]
+
+[package.dependencies]
+Pillow = ">=2.4.0"
+python-magic = ">=0.4.15,<1.0.0"
+
+[[package]]
 name = "draftjs-sanitizer"
 version = "1.0.0"
 description = "Convert basic HTML into DraftJS JSON format."
