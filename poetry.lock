@@ -1355,7 +1355,6 @@ files = [
 Django = ">=1.11"
 jsonfield = "*"
 prices = ">=1.0.0"
-prices = ">=1.0.0"
 requests = "*"
 
 [[package]]
