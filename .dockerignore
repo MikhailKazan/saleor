@@ -5,6 +5,7 @@ media
 node_modules
 static
 localdocker
+credentials.env
 # Elastic Beanstalk Files
 .elasticbeanstalk/*
 .git

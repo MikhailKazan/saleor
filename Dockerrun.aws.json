@@ -1,0 +1,19 @@
+{
+  "AWSEBDockerrunVersion": "2",
+  "containerDefinitions": [
+    {
+      "Name": "kazanmichail/enversio:core",
+      "Update": "false"
+    }
+  ],
+  "authentication": {
+    "bucket": "enversio-docker-temp-bucket",
+    "key": "dockercfg"
+  },
+  "Ports": [
+    {
+      "ContainerPort": "8000",
+      "HostPort": "80"
+    }
+  ]
+}
