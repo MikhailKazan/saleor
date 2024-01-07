@@ -562,6 +562,11 @@ BEAT_UPDATE_SEARCH_SEC = parse(
 )
 BEAT_UPDATE_SEARCH_EXPIRE_AFTER_SEC = BEAT_UPDATE_SEARCH_SEC
 
+# Expire orders task setting
+BEAT_EXPIRE_ORDERS_AFTER_TIMEDELTA = timedelta(
+    seconds=parse(os.environ.get("BEAT_EXPIRE_ORDERS_AFTER_TIMEDELTA", "5 minutes"))
+)
+
 # Defines the Celery beat scheduler entries.
 #
 # Note: if a Celery task triggered by a Celery beat entry has an expiration
