@@ -36,6 +36,7 @@ DEFAULT_TEMPLATE_HELP_TEXT = (
     'default Saleor template by providing the "DEFAULT" string as a value.'
 )
 DEFAULT_SUBJECT_HELP_TEXT = "An email subject built with Handlebars template language."
+DEFAULT_EMAIL_TEXT = "An email address."
 DEFAULT_EMAIL_VALUE = "DEFAULT"
 DEFAULT_EMAIL_TIMEOUT = 5
 

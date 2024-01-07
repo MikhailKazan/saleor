@@ -1,23 +1,23 @@
 {
-  "name": "saleor",
-  "version": "3.19.0-a.0",
+  "name": "enversio",
+  "version": "1.0.1-a",
   "engines": {
     "node": ">=16 <17",
     "npm": ">=7"
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/saleor/saleor.git"
+    "url": "git://github.com/MikhailKazan/enversio-core.git"
   },
-  "author": "Saleor Commerce",
+  "author": "Enversio",
   "license": "BSD-3-Clause",
   "bugs": {
-    "url": "https://github.com/saleor/saleor/issues"
+    "url": "https://github.com/MikhailKazan/enversio-core/issues"
   },
-  "homepage": "http://saleor.io/",
+  "homepage": "http://enversio.com/",
   "devDependencies": {
     "@release-it/bumper": "^4.0.0",
-    "release-it": "^15.6.0"
+    "release-it": "^15.4.2"
   },
   "scripts": {
     "build-schema": "python manage.py get_graphql_schema > saleor/graphql/schema.graphql",

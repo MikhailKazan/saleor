@@ -12,6 +12,7 @@ from ..email_common import (
     DEFAULT_EMAIL_CONFIG_STRUCTURE,
     DEFAULT_EMAIL_CONFIGURATION,
     DEFAULT_EMAIL_VALUE,
+    DEFAULT_EMAIL_TEXT,
     DEFAULT_SUBJECT_HELP_TEXT,
     DEFAULT_TEMPLATE_HELP_TEXT,
     EmailConfig,
@@ -24,6 +25,7 @@ from .notify_events import (
     send_account_change_email_confirm,
     send_account_change_email_request,
     send_account_confirmation,
+    send_account_completion,
     send_account_delete,
     send_account_password_reset_event,
     send_account_set_customer_password,
@@ -41,13 +43,13 @@ from .notify_events import (
 if TYPE_CHECKING:
     from ..models import PluginConfiguration
 
-
 logger = logging.getLogger(__name__)
 
 
 def get_user_event_map():
     return {
         UserNotifyEvent.ACCOUNT_CONFIRMATION: send_account_confirmation,
+        UserNotifyEvent.ACCOUNT_COMPLETION: send_account_completion,
         UserNotifyEvent.ACCOUNT_SET_CUSTOMER_PASSWORD: (
             send_account_set_customer_password
         ),
@@ -73,118 +75,139 @@ class UserEmailPlugin(BasePlugin):
     CONFIGURATION_PER_CHANNEL = True
 
     DEFAULT_CONFIGURATION = [
-        {
-            "name": constants.ACCOUNT_CONFIRMATION_SUBJECT_FIELD,
-            "value": constants.ACCOUNT_CONFIRMATION_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ACCOUNT_CONFIRMATION_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ACCOUNT_SET_CUSTOMER_PASSWORD_SUBJECT_FIELD,
-            "value": constants.ACCOUNT_SET_CUSTOMER_PASSWORD_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ACCOUNT_SET_CUSTOMER_PASSWORD_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ACCOUNT_DELETE_SUBJECT_FIELD,
-            "value": constants.ACCOUNT_DELETE_DEFAULT_SUBJECT,
-        },
-        {"name": constants.ACCOUNT_DELETE_TEMPLATE_FIELD, "value": DEFAULT_EMAIL_VALUE},
-        {
-            "name": constants.ACCOUNT_CHANGE_EMAIL_CONFIRM_SUBJECT_FIELD,
-            "value": constants.ACCOUNT_CHANGE_EMAIL_CONFIRM_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ACCOUNT_CHANGE_EMAIL_CONFIRM_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ACCOUNT_CHANGE_EMAIL_REQUEST_SUBJECT_FIELD,
-            "value": constants.ACCOUNT_CHANGE_EMAIL_REQUEST_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ACCOUNT_CHANGE_EMAIL_REQUEST_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ACCOUNT_PASSWORD_RESET_SUBJECT_FIELD,
-            "value": constants.ACCOUNT_PASSWORD_RESET_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ACCOUNT_PASSWORD_RESET_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.INVOICE_READY_SUBJECT_FIELD,
-            "value": constants.INVOICE_READY_DEFAULT_SUBJECT,
-        },
-        {"name": constants.INVOICE_READY_TEMPLATE_FIELD, "value": DEFAULT_EMAIL_VALUE},
-        {
-            "name": constants.ORDER_CONFIRMATION_SUBJECT_FIELD,
-            "value": constants.ORDER_CONFIRMATION_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ORDER_CONFIRMATION_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ORDER_CONFIRMED_SUBJECT_FIELD,
-            "value": constants.ORDER_CONFIRMED_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ORDER_CONFIRMED_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ORDER_FULFILLMENT_CONFIRMATION_SUBJECT_FIELD,
-            "value": constants.ORDER_FULFILLMENT_CONFIRMATION_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ORDER_FULFILLMENT_CONFIRMATION_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ORDER_FULFILLMENT_UPDATE_SUBJECT_FIELD,
-            "value": constants.ORDER_FULFILLMENT_UPDATE_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ORDER_FULFILLMENT_UPDATE_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ORDER_PAYMENT_CONFIRMATION_SUBJECT_FIELD,
-            "value": constants.ORDER_PAYMENT_CONFIRMATION_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ORDER_PAYMENT_CONFIRMATION_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.ORDER_CANCELED_SUBJECT_FIELD,
-            "value": constants.ORDER_CANCELED_DEFAULT_SUBJECT,
-        },
-        {"name": constants.ORDER_CANCELED_TEMPLATE_FIELD, "value": DEFAULT_EMAIL_VALUE},
-        {
-            "name": constants.ORDER_REFUND_CONFIRMATION_SUBJECT_FIELD,
-            "value": constants.ORDER_REFUND_CONFIRMATION_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.ORDER_REFUND_CONFIRMATION_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-        {
-            "name": constants.SEND_GIFT_CARD_SUBJECT_FIELD,
-            "value": constants.SEND_GIFT_CARD_DEFAULT_SUBJECT,
-        },
-        {
-            "name": constants.SEND_GIFT_CARD_TEMPLATE_FIELD,
-            "value": DEFAULT_EMAIL_VALUE,
-        },
-    ] + DEFAULT_EMAIL_CONFIGURATION
+                                {
+                                    "name": constants.ACCOUNT_CONFIRMATION_SUBJECT_FIELD,
+                                    "value": constants.ACCOUNT_CONFIRMATION_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_CONFIRMATION_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_COMPLETION_SUBJECT_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_COMPLETION_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_COMPLETION_EMAIL_NAME_FIELD,
+                                    "value": "",
+                                },
+                                {
+                                    "name": constants.ACCOUNT_COMPLETION_EMAIL_ADDRESS_FIELD,
+                                    "value": "",
+                                },
+                                {
+                                    "name": constants.ACCOUNT_SET_CUSTOMER_PASSWORD_SUBJECT_FIELD,
+                                    "value": constants.ACCOUNT_SET_CUSTOMER_PASSWORD_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_SET_CUSTOMER_PASSWORD_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_DELETE_SUBJECT_FIELD,
+                                    "value": constants.ACCOUNT_DELETE_DEFAULT_SUBJECT,
+                                },
+                                {"name": constants.ACCOUNT_DELETE_TEMPLATE_FIELD,
+                                 "value": DEFAULT_EMAIL_VALUE},
+                                {
+                                    "name": constants.ACCOUNT_CHANGE_EMAIL_CONFIRM_SUBJECT_FIELD,
+                                    "value": constants.ACCOUNT_CHANGE_EMAIL_CONFIRM_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_CHANGE_EMAIL_CONFIRM_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_CHANGE_EMAIL_REQUEST_SUBJECT_FIELD,
+                                    "value": constants.ACCOUNT_CHANGE_EMAIL_REQUEST_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_CHANGE_EMAIL_REQUEST_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_PASSWORD_RESET_SUBJECT_FIELD,
+                                    "value": constants.ACCOUNT_PASSWORD_RESET_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ACCOUNT_PASSWORD_RESET_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.INVOICE_READY_SUBJECT_FIELD,
+                                    "value": constants.INVOICE_READY_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.INVOICE_READY_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE},
+                                {
+                                    "name": constants.ORDER_CONFIRMATION_SUBJECT_FIELD,
+                                    "value": constants.ORDER_CONFIRMATION_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ORDER_CONFIRMATION_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ORDER_CONFIRMED_SUBJECT_FIELD,
+                                    "value": constants.ORDER_CONFIRMED_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ORDER_CONFIRMED_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ORDER_FULFILLMENT_CONFIRMATION_SUBJECT_FIELD,
+                                    "value": constants.ORDER_FULFILLMENT_CONFIRMATION_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ORDER_FULFILLMENT_CONFIRMATION_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ORDER_FULFILLMENT_UPDATE_SUBJECT_FIELD,
+                                    "value": constants.ORDER_FULFILLMENT_UPDATE_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ORDER_FULFILLMENT_UPDATE_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ORDER_PAYMENT_CONFIRMATION_SUBJECT_FIELD,
+                                    "value": constants.ORDER_PAYMENT_CONFIRMATION_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ORDER_PAYMENT_CONFIRMATION_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.ORDER_CANCELED_SUBJECT_FIELD,
+                                    "value": constants.ORDER_CANCELED_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ORDER_CANCELED_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE},
+                                {
+                                    "name": constants.ORDER_REFUND_CONFIRMATION_SUBJECT_FIELD,
+                                    "value": constants.ORDER_REFUND_CONFIRMATION_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.ORDER_REFUND_CONFIRMATION_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                                {
+                                    "name": constants.SEND_GIFT_CARD_SUBJECT_FIELD,
+                                    "value": constants.SEND_GIFT_CARD_DEFAULT_SUBJECT,
+                                },
+                                {
+                                    "name": constants.SEND_GIFT_CARD_TEMPLATE_FIELD,
+                                    "value": DEFAULT_EMAIL_VALUE,
+                                },
+                            ] + DEFAULT_EMAIL_CONFIGURATION
 
     CONFIG_STRUCTURE = {
         constants.ACCOUNT_CONFIRMATION_SUBJECT_FIELD: {
@@ -196,6 +219,26 @@ class UserEmailPlugin(BasePlugin):
             "type": ConfigurationTypeField.MULTILINE,
             "help_text": DEFAULT_TEMPLATE_HELP_TEXT,
             "label": "Account confirmation - template",
+        },
+        constants.ACCOUNT_COMPLETION_SUBJECT_FIELD: {
+            "type": ConfigurationTypeField.STRING,
+            "help_text": DEFAULT_SUBJECT_HELP_TEXT,
+            "label": "Account completion - subject",
+        },
+        constants.ACCOUNT_COMPLETION_TEMPLATE_FIELD: {
+            "type": ConfigurationTypeField.MULTILINE,
+            "help_text": DEFAULT_TEMPLATE_HELP_TEXT,
+            "label": "Account completion - template",
+        },
+        constants.ACCOUNT_COMPLETION_EMAIL_NAME_FIELD: {
+            "type": ConfigurationTypeField.STRING,
+            "help_text": "Name of sender",
+            "label": "Name of sender for account completion email",
+        },
+        constants.ACCOUNT_COMPLETION_EMAIL_ADDRESS_FIELD: {
+            "type": ConfigurationTypeField.STRING,
+            "help_text": DEFAULT_EMAIL_TEXT,
+            "label": "Account completion - E-Mail Address",
         },
         constants.ACCOUNT_SET_CUSTOMER_PASSWORD_SUBJECT_FIELD: {
             "type": ConfigurationTypeField.STRING,

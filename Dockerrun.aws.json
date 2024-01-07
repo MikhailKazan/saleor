@@ -1,0 +1,22 @@
+{
+  "AWSEBDockerrunVersion": "2",
+  "containerDefinitions": [
+    {
+      "essential": true,
+      "memory": 512,
+      "Image": "https://hub.docker.com/repository/docker/kazanmichail/enversio",
+      "Name": "kazanmichail/enversio:core",
+      "Update": "false",
+      "portMappings": [
+        {
+          "hostPort": 80,
+          "containerPort": 8000
+        }
+      ]
+    }
+  ],
+  "authentication": {
+    "bucket": "enversio-docker-temp-bucket",
+    "key": "dockercfg"
+  }
+}

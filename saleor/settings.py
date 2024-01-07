@@ -4,7 +4,7 @@ import os
 import os.path
 import warnings
 from datetime import timedelta
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import urlparse
 
 import dj_database_url
@@ -73,7 +73,7 @@ MANAGERS = ADMINS
 
 APPEND_SLASH = False
 
-_DEFAULT_CLIENT_HOSTS = "localhost,127.0.0.1"
+_DEFAULT_CLIENT_HOSTS = os.environ.get("_DEFAULT_CLIENT_HOSTS", "localhost")
 
 ALLOWED_CLIENT_HOSTS = os.environ.get("ALLOWED_CLIENT_HOSTS")
 if not ALLOWED_CLIENT_HOSTS:
@@ -101,11 +101,11 @@ DATABASE_CONNECTION_REPLICA_NAME = "replica"
 
 DATABASES = {
     DATABASE_CONNECTION_DEFAULT_NAME: dj_database_url.config(
-        default="postgres://saleor:saleor@localhost:5432/saleor",
+        default="postgres://CMsUKuFjdoZEiLIEBKPdTwWd:e47Y2RbziAVpjV0BC808BRlshmkxmtFfvpKrnEi2ygKf3JQgXMCL5YdGxQ20w09o@localhost:5432/shop",
         conn_max_age=DB_CONN_MAX_AGE,
     ),
     DATABASE_CONNECTION_REPLICA_NAME: dj_database_url.config(
-        default="postgres://saleor:saleor@localhost:5432/saleor",
+        default="postgres://enverio:enversio@localhost:5432/enversio",
         # TODO: We need to add read only user to saleor platform,
         # and we need to update docs.
         # default="postgres://saleor_read_only:saleor@localhost:5432/saleor",
@@ -148,6 +148,11 @@ EMAIL_USE_TLS: bool = email_config.get("EMAIL_USE_TLS", False)
 EMAIL_USE_SSL: bool = email_config.get("EMAIL_USE_SSL", False)
 
 ENABLE_SSL: bool = get_bool_from_env("ENABLE_SSL", False)
+
+ENABLE_ACCOUNT_COMPLETION_BY_EMAIL = get_bool_from_env(
+    "ENABLE_ACCOUNT_COMPLETION_BY_EMAIL", True
+)
+
 
 # URL on which Saleor is hosted (e.g., https://api.example.com/). This has precedence
 # over ENABLE_SSL and Shop.domain when generating URLs pointing to itself.
@@ -212,7 +217,6 @@ SECRET_KEY = os.environ.get("SECRET_KEY")
 PASSWORD_HASHERS = [
     *global_settings.PASSWORD_HASHERS,
     "django.contrib.auth.hashers.BCryptPasswordHasher",
-    "saleor.core.hashers.SHA512Base64PBKDF2PasswordHasher",
 ]
 
 if not SECRET_KEY and DEBUG:

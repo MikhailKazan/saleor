@@ -1,9 +1,10 @@
 *.py[cod]
 .*
-!.devcontainer
 !.dockerignore
 !.github
 !.gitignore
+!.nvmrc
+!.pylintrc
 !.vscode
 *.log
 *.pot
@@ -18,6 +19,8 @@ dist/
 /media/
 /node_modules/
 /static/
+/localdocker/
+
 /digital_contents/
 # Environments
 .env
@@ -30,3 +33,8 @@ venv.bak/
 
 # Exported results file
 django-queries-results.html
+
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml

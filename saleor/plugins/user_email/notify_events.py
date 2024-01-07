@@ -4,6 +4,7 @@ from ..email_common import get_email_subject, get_email_template_or_default
 from . import constants
 from .tasks import (
     send_account_confirmation_email_task,
+    send_account_completion_email_task,
     send_account_delete_confirmation_email_task,
     send_fulfillment_confirmation_email_task,
     send_fulfillment_update_email_task,
@@ -68,6 +69,33 @@ def send_account_confirmation(payload: dict, config: dict, plugin: "UserEmailPlu
         constants.ACCOUNT_CONFIRMATION_DEFAULT_SUBJECT,
     )
     send_account_confirmation_email_task.delay(
+        recipient_email, payload, config, subject, template
+    )
+
+
+def send_account_completion(payload: dict, config: dict, plugin: "UserEmailPlugin"):
+    recipient_email = payload["recipient_email"]
+    template = get_email_template_or_default(
+        plugin,
+        constants.ACCOUNT_COMPLETION_TEMPLATE_FIELD,
+        constants.ACCOUNT_COMPLETION_DEFAULT_TEMPLATE,
+        constants.DEFAULT_EMAIL_TEMPLATES_PATH,
+    )
+    if not template:
+        # Empty template means that we don't want to trigger a given event.
+        return
+    subject = get_email_subject(
+        plugin.configuration,
+        constants.ACCOUNT_COMPLETION_SUBJECT_FIELD,
+        constants.ACCOUNT_COMPLETION_DEFAULT_SUBJECT,
+    )
+    for config_field in plugin.configuration:
+        if config_field["name"] == constants.ACCOUNT_COMPLETION_EMAIL_ADDRESS_FIELD:
+            payload["sender_address"] = config_field["value"]
+        if config_field["name"] == constants.ACCOUNT_COMPLETION_EMAIL_NAME_FIELD:
+            payload["sender_name"] = config_field["value"]
+
+    send_account_completion_email_task.delay(
         recipient_email, payload, config, subject, template
     )
 

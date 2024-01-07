@@ -39,8 +39,12 @@ documentation = "https://docs.saleor.io/"
   django-mptt = "^0"
   django-phonenumber-field = ">=4,<8"
   django-prices = "^2.3"
-  django-redis = "^5.0.0"
-  django-stubs-ext = "^4.2.1"
+  django-prices-openexchangerates = "^1.2.0"
+  django-prices-vatlayer = "^1.1.0"
+  django-stubs-ext = "^4.2.7"
+  django-versatileimagefield = "^2.1"
+  jsonfield = "^3.1.0"
+  google-measurement-protocol = "1.1.0"
   draftjs-sanitizer = "^1.0.0"
   faker = ">=4.1,<21.0"
   google-cloud-pubsub = ">=1.7,<3.0"
@@ -146,6 +150,10 @@ documentation = "https://docs.saleor.io/"
 
 [tool.deptry]
 extend_exclude = ["conftest\\.py", ".*/conftest\\.py", ".*/tests/.*"]
+  vcrpy = ">=4.0,<5.0"
+
+[tool.deptry]
+extend_exclude = ["conftest\\.py", ".*/conftest\\.py", ".*/tests/.*"]
 
   [tool.deptry.package_module_name_map]
   graphql-core = "graphql"
@@ -157,6 +165,17 @@ extend_exclude = ["conftest\\.py", ".*/conftest\\.py", ".*/tests/.*"]
   DEP002 = ["azure-common", "azure-storage-blob", "azure-storage-common", "django-redis", "gunicorn", "psycopg2"]
   DEP004 = ["debug_toolbar", "graphiql_debug_toolbar"]
 
+[tool.ruff]
+extend-select = ["D", "I", "ISC001", "ISC002", "PIE", "PT", "T20", "UP"]
+ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107", "D202", "D203", "D206", "D213", "D407", "PT019"]
+target-version = "py39"
+
+  [tool.ruff.flake8-pytest-style]
+  fixture-parentheses = false
+  mark-parentheses = false
+
+  [tool.ruff.isort]
+  known-first-party = ["saleor"]
 [tool.ruff]
 extend-select = ["D", "I", "ISC001", "ISC002", "PIE", "PT", "T20", "UP"]
 ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107", "D202", "D203", "D206", "D213", "D407", "PT019"]

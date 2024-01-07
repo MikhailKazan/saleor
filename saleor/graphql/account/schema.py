@@ -270,6 +270,7 @@ class AccountMutations(graphene.ObjectType):
     request_password_reset = RequestPasswordReset.Field()
     send_confirmation_email = SendConfirmationEmail.Field()
     confirm_account = ConfirmAccount.Field()
+    confirm_email = ConfirmEmail.Field()
     set_password = SetPassword.Field()
     password_change = PasswordChange.Field()
     request_email_change = RequestEmailChange.Field()

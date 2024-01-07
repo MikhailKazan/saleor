@@ -23,6 +23,24 @@ def send_account_confirmation_email_task(
 
 
 @app.task(compression="zlib")
+def send_account_completion_email_task(
+    recipient_email, payload, config, subject, template
+):
+    email_config = EmailConfig(**config)
+
+    email_config.sender_name = payload['sender_name']
+    email_config.sender_address = payload['sender_address']
+
+    send_email(
+        config=email_config,
+        recipient_list=[recipient_email],
+        context=payload,
+        subject=subject,
+        template_str=template,
+    )
+
+
+@app.task(compression="zlib")
 def send_password_reset_email_task(recipient_email, payload, config, subject, template):
     user_id = payload.get("user", {}).get("id")
     email_config = EmailConfig(**config)
